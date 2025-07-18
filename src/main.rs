@@ -11,12 +11,14 @@ use ratatui::{
     widgets::Paragraph,
     Frame, Terminal,
 };
+use ropey::{Rope, RopeSlice};
 use std::{
     env,
     error::Error,
     fs,
     io,
     path::PathBuf,
+    time::{Duration, Instant},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -29,120 +31,188 @@ struct VisualLine {
     is_virtual: bool,
 }
 
+#[derive(Clone)]
 struct TextBuffer {
-    content: String,
-    lines: Vec<String>,
+    rope: Rope,
 }
 
 impl TextBuffer {
     fn new() -> Self {
         Self {
-            content: String::new(),
-            lines: vec![String::new()],
+            rope: Rope::new(),
         }
     }
 
     fn from_string(s: String) -> Self {
-        let lines: Vec<String> = s.lines().map(|l| l.to_string()).collect();
-        let lines = if lines.is_empty() {
-            vec![String::new()]
-        } else {
-            lines
-        };
-        Self { content: s, lines }
+        Self {
+            rope: Rope::from_str(&s),
+        }
     }
 
     fn insert_char(&mut self, byte_pos: usize, ch: char) {
-        self.content.insert(byte_pos, ch);
-        self.rebuild_lines();
+        let char_idx = self.rope.byte_to_char(byte_pos);
+        self.rope.insert_char(char_idx, ch);
     }
 
-    fn delete_char(&mut self, byte_pos: usize) {
-        if byte_pos < self.content.len() {
-            let mut chars = self.content.chars();
-            for _ in 0..self.content[..byte_pos].chars().count() {
-                chars.next();
-            }
-            if let Some(ch) = chars.next() {
-                self.content.drain(byte_pos..byte_pos + ch.len_utf8());
-                self.rebuild_lines();
+    fn insert_str(&mut self, byte_pos: usize, text: &str) {
+        let char_idx = self.rope.byte_to_char(byte_pos);
+        self.rope.insert(char_idx, text);
+    }
+
+    fn delete_range(&mut self, start_byte: usize, end_byte: usize) -> String {
+        let start_char = self.rope.byte_to_char(start_byte);
+        let end_char = self.rope.byte_to_char(end_byte);
+        let deleted_text = self.rope.slice(start_char..end_char).to_string();
+        self.rope.remove(start_char..end_char);
+        deleted_text
+    }
+
+    fn delete_char(&mut self, byte_pos: usize) -> Option<char> {
+        if byte_pos < self.rope.len_bytes() {
+            let char_idx = self.rope.byte_to_char(byte_pos);
+            if char_idx < self.rope.len_chars() {
+                let ch = self.rope.char(char_idx);
+                let next_char_idx = char_idx + 1;
+                self.rope.remove(char_idx..next_char_idx);
+                return Some(ch);
             }
         }
+        None
     }
 
-    fn backspace(&mut self, byte_pos: usize) {
+    fn backspace(&mut self, byte_pos: usize) -> Option<(usize, char)> {
         if byte_pos > 0 {
-            let mut pos = byte_pos;
-            while pos > 0 && !self.content.is_char_boundary(pos) {
-                pos -= 1;
+            let char_idx = self.rope.byte_to_char(byte_pos);
+            if char_idx > 0 {
+                let prev_char_idx = char_idx - 1;
+                let ch = self.rope.char(prev_char_idx);
+                let prev_byte = self.rope.char_to_byte(prev_char_idx);
+                self.rope.remove(prev_char_idx..char_idx);
+                return Some((byte_pos - prev_byte, ch));
             }
-            if pos > 0 {
-                let ch_start = self.content[..pos]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                self.content.drain(ch_start..pos);
-                self.rebuild_lines();
-            }
+        }
+        None
+    }
+
+    fn get_line(&self, index: usize) -> Option<RopeSlice> {
+        if index < self.rope.len_lines() {
+            Some(self.rope.line(index))
+        } else {
+            None
         }
     }
 
-    fn rebuild_lines(&mut self) {
-        self.lines = self.content.lines().map(|l| l.to_string()).collect();
-        if self.lines.is_empty() {
-            self.lines.push(String::new());
-        }
-        if self.content.ends_with('\n') {
-            self.lines.push(String::new());
-        }
+    fn len_bytes(&self) -> usize {
+        self.rope.len_bytes()
     }
 
-    fn get_line(&self, index: usize) -> Option<&str> {
-        self.lines.get(index).map(|s| s.as_str())
+    fn len_lines(&self) -> usize {
+        self.rope.len_lines()
     }
 
     fn byte_to_line_col(&self, byte_pos: usize) -> (usize, usize, usize) {
-        let mut current_byte = 0;
-        for (line_idx, line) in self.lines.iter().enumerate() {
-            let line_start = current_byte;
-            let line_bytes = line.len();
-            let line_end = current_byte + line_bytes;
-            
-            if byte_pos <= line_end || line_idx == self.lines.len() - 1 {
-                let line_byte_offset = byte_pos.saturating_sub(line_start).min(line_bytes);
-                let col = line[..line_byte_offset].width();
-                return (line_idx, col, line_byte_offset);
+        let char_idx = self.rope.byte_to_char(byte_pos.min(self.rope.len_bytes()));
+        let line_idx = self.rope.char_to_line(char_idx);
+        let line_start_char = self.rope.line_to_char(line_idx);
+        let line_char_offset = char_idx - line_start_char;
+        
+        let line = self.rope.line(line_idx);
+        let line_byte_offset = if line_char_offset == 0 {
+            0
+        } else {
+            let mut byte_offset = 0;
+            for (i, ch) in line.chars().enumerate() {
+                if i >= line_char_offset {
+                    break;
+                }
+                byte_offset += ch.len_utf8();
             }
-            
-            current_byte = line_end + 1;
-        }
-        (0, 0, 0)
+            byte_offset
+        };
+        
+        let col = line.slice(..line.len_chars().min(line_char_offset))
+            .as_str()
+            .map(|s| s.width())
+            .unwrap_or(0);
+        
+        (line_idx, col, line_byte_offset)
     }
 
     fn line_col_to_byte(&self, line: usize, target_col: usize) -> usize {
-        let mut byte_pos = 0;
-        
-        for (idx, l) in self.lines.iter().enumerate() {
-            if idx < line {
-                byte_pos += l.len() + 1;
-            } else if idx == line {
-                let mut current_col = 0;
-                for (i, ch) in l.char_indices() {
-                    let ch_width = ch.to_string().width();
-                    if current_col >= target_col {
-                        return byte_pos + i;
-                    }
-                    current_col += ch_width;
-                }
-                return byte_pos + l.len();
-            } else {
-                break;
-            }
+        if line >= self.rope.len_lines() {
+            return self.rope.len_bytes();
         }
         
-        byte_pos
+        let line_start_char = self.rope.line_to_char(line);
+        let line_slice = self.rope.line(line);
+        
+        let mut current_col = 0;
+        let mut char_offset = 0;
+        
+        for ch in line_slice.chars() {
+            let ch_width = ch.to_string().width();
+            if current_col >= target_col {
+                break;
+            }
+            current_col += ch_width;
+            char_offset += 1;
+        }
+        
+        self.rope.char_to_byte(line_start_char + char_offset)
     }
+
+    fn to_string(&self) -> String {
+        self.rope.to_string()
+    }
+}
+
+#[derive(Clone, Debug)]
+enum EditOperation {
+    Insert {
+        position: usize,
+        text: String,
+        caret_before: usize,
+        caret_after: usize,
+    },
+    Delete {
+        position: usize,
+        text: String,
+        caret_before: usize,
+        caret_after: usize,
+    },
+}
+
+impl EditOperation {
+    fn undo(&self, buffer: &mut TextBuffer) -> usize {
+        match self {
+            EditOperation::Insert { position, text, caret_before, .. } => {
+                buffer.delete_range(*position, position + text.len());
+                *caret_before
+            }
+            EditOperation::Delete { position, text, caret_before, .. } => {
+                buffer.insert_str(*position, text);
+                *caret_before
+            }
+        }
+    }
+
+    fn redo(&self, buffer: &mut TextBuffer) -> usize {
+        match self {
+            EditOperation::Insert { position, text, caret_after, .. } => {
+                buffer.insert_str(*position, text);
+                *caret_after
+            }
+            EditOperation::Delete { position, text, caret_after, .. } => {
+                buffer.delete_range(*position, position + text.len());
+                *caret_after
+            }
+        }
+    }
+}
+
+struct UndoGroup {
+    operations: Vec<EditOperation>,
+    timestamp: Instant,
 }
 
 struct Editor {
@@ -157,6 +227,13 @@ struct Editor {
     virtual_lines_count: usize,
     filename: Option<PathBuf>,
     modified: bool,
+    
+    // Undo/redo state
+    undo_stack: Vec<UndoGroup>,
+    redo_stack: Vec<UndoGroup>,
+    current_undo_group: Option<UndoGroup>,
+    last_edit_time: Option<Instant>,
+    undo_group_timeout: Duration,
 }
 
 impl Editor {
@@ -174,6 +251,11 @@ impl Editor {
             virtual_lines_count: 2,
             filename: None,
             modified: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            current_undo_group: None,
+            last_edit_time: None,
+            undo_group_timeout: Duration::from_secs(1),
         };
         editor.rebuild_visual_lines(80);
         editor
@@ -184,6 +266,106 @@ impl Editor {
         self.caret_byte = 0;
         self.preferred_col = 0;
         self.rebuild_visual_lines(viewport_width);
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.current_undo_group = None;
+        self.last_edit_time = None;
+    }
+
+    fn push_edit_operation(&mut self, operation: EditOperation) {
+        let now = Instant::now();
+        
+        // Check if we should create a new undo group
+        let should_create_new_group = match self.last_edit_time {
+            Some(last_time) => now.duration_since(last_time) > self.undo_group_timeout,
+            None => true,
+        };
+        
+        if should_create_new_group {
+            // Push the current group to the undo stack if it exists
+            if let Some(group) = self.current_undo_group.take() {
+                if !group.operations.is_empty() {
+                    self.undo_stack.push(group);
+                }
+            }
+            
+            // Create a new group
+            self.current_undo_group = Some(UndoGroup {
+                operations: vec![operation],
+                timestamp: now,
+            });
+        } else {
+            // Add to the current group
+            if let Some(ref mut group) = self.current_undo_group {
+                group.operations.push(operation);
+            } else {
+                self.current_undo_group = Some(UndoGroup {
+                    operations: vec![operation],
+                    timestamp: now,
+                });
+            }
+        }
+        
+        // Clear redo stack when new edit is made
+        self.redo_stack.clear();
+        self.last_edit_time = Some(now);
+    }
+
+    fn finalize_current_undo_group(&mut self) {
+        if let Some(group) = self.current_undo_group.take() {
+            if !group.operations.is_empty() {
+                self.undo_stack.push(group);
+            }
+        }
+    }
+
+    fn undo(&mut self, viewport_width: usize) {
+        // First, finalize any pending operations
+        self.finalize_current_undo_group();
+        
+        if let Some(mut group) = self.undo_stack.pop() {
+            let mut caret = self.caret_byte;
+            
+            // Apply all operations in reverse order
+            for operation in group.operations.iter().rev() {
+                caret = operation.undo(&mut self.buffer);
+            }
+            
+            self.caret_byte = caret;
+            self.rebuild_visual_lines(viewport_width);
+            
+            // Update preferred column
+            let (_, col) = self.get_caret_visual_position();
+            self.preferred_col = col;
+            
+            // Move the group to redo stack
+            self.redo_stack.push(group);
+            
+            self.modified = !self.undo_stack.is_empty() || self.current_undo_group.is_some();
+        }
+    }
+
+    fn redo(&mut self, viewport_width: usize) {
+        if let Some(mut group) = self.redo_stack.pop() {
+            let mut caret = self.caret_byte;
+            
+            // Apply all operations in forward order
+            for operation in group.operations.iter() {
+                caret = operation.redo(&mut self.buffer);
+            }
+            
+            self.caret_byte = caret;
+            self.rebuild_visual_lines(viewport_width);
+            
+            // Update preferred column
+            let (_, col) = self.get_caret_visual_position();
+            self.preferred_col = col;
+            
+            // Move the group to undo stack
+            self.undo_stack.push(group);
+            
+            self.modified = true;
+        }
     }
 
     fn calculate_indentation(line: &str) -> usize {
@@ -244,126 +426,139 @@ impl Editor {
         if !self.word_wrap {
             // Without word wrap, each logical line is a visual line
             let mut byte_pos = 0;
-            for line in &self.buffer.lines {
-                self.visual_lines.push(VisualLine {
-                    start_byte: byte_pos,
-                    end_byte: byte_pos + line.len(),
-                    is_continuation: false,
-                    virtual_indent: 0,
-                    is_virtual: false,
-                });
-                byte_pos += line.len() + 1;
+            for line_idx in 0..self.buffer.len_lines() {
+                if let Some(line) = self.buffer.get_line(line_idx) {
+                    let line_bytes = line.len_bytes();
+                    let has_newline = line_idx < self.buffer.len_lines() - 1;
+                    let actual_bytes = if has_newline { line_bytes } else { line_bytes };
+                    
+                    self.visual_lines.push(VisualLine {
+                        start_byte: byte_pos,
+                        end_byte: byte_pos + actual_bytes,
+                        is_continuation: false,
+                        virtual_indent: 0,
+                        is_virtual: false,
+                    });
+                    byte_pos += line_bytes;
+                }
             }
         } else {
             // With word wrap
             let mut byte_pos = 0;
-            for line in &self.buffer.lines {
-                let continuation_indent = Self::calculate_indentation(line);
-                
-                if line.is_empty() {
-                    self.visual_lines.push(VisualLine {
-                        start_byte: byte_pos,
-                        end_byte: byte_pos,
-                        is_continuation: false,
-                        virtual_indent: 0,
-                        is_virtual: false,
-                    });
-                    byte_pos += 1;
-                    continue;
-                }
-
-                let mut line_start = byte_pos;
-                let mut current_width = 0;
-                let mut last_break_pos = line_start;
-                let mut is_first_segment = true;
-
-                for (i, ch) in line.char_indices() {
-                    let ch_width = ch.to_string().width();
-                    let ch_byte_pos = byte_pos + i;
+            for line_idx in 0..self.buffer.len_lines() {
+                if let Some(line_slice) = self.buffer.get_line(line_idx) {
+                    let line_str = line_slice.as_str().unwrap_or("");
+                    let continuation_indent = Self::calculate_indentation(line_str);
+                    let line_bytes = line_slice.len_bytes();
+                    let has_newline = line_idx < self.buffer.len_lines() - 1;
                     
-                    let effective_viewport_width = if is_first_segment {
-                        viewport_width
-                    } else {
-                        viewport_width.saturating_sub(continuation_indent)
-                    };
-                    
-                    // Check if adding this character would exceed the width
-                    if current_width + ch_width > effective_viewport_width && current_width > 0 {
-                        // Find break position (prefer breaking at spaces)
-                        let break_pos = if last_break_pos > line_start {
-                            last_break_pos
+                    if line_str.is_empty() {
+                        self.visual_lines.push(VisualLine {
+                            start_byte: byte_pos,
+                            end_byte: byte_pos,
+                            is_continuation: false,
+                            virtual_indent: 0,
+                            is_virtual: false,
+                        });
+                        byte_pos += line_bytes;
+                        continue;
+                    }
+
+                    let mut line_start = byte_pos;
+                    let mut current_width = 0;
+                    let mut last_break_pos = line_start;
+                    let mut is_first_segment = true;
+
+                    for (i, ch) in line_str.char_indices() {
+                        let ch_width = ch.to_string().width();
+                        let ch_byte_pos = byte_pos + i;
+                        
+                        let effective_viewport_width = if is_first_segment {
+                            viewport_width
                         } else {
-                            ch_byte_pos
+                            viewport_width.saturating_sub(continuation_indent)
                         };
                         
+                        // Check if adding this character would exceed the width
+                        if current_width + ch_width > effective_viewport_width && current_width > 0 {
+                            // Find break position (prefer breaking at spaces)
+                            let break_pos = if last_break_pos > line_start {
+                                last_break_pos
+                            } else {
+                                ch_byte_pos
+                            };
+                            
+                            self.visual_lines.push(VisualLine {
+                                start_byte: line_start,
+                                end_byte: break_pos,
+                                is_continuation: !is_first_segment,
+                                virtual_indent: if is_first_segment { 0 } else { continuation_indent },
+                                is_virtual: false,
+                            });
+                            
+                            is_first_segment = false;
+                            line_start = break_pos;
+                            
+                            current_width = 0;
+                            last_break_pos = line_start;
+                            
+                            // Recalculate current width after line break
+                            if line_start <= ch_byte_pos {
+                                let start_offset = line_start - byte_pos;
+                                let end_offset = i + ch.len_utf8();
+                                if start_offset < end_offset && end_offset <= line_str.len() {
+                                    for ch2 in line_str[start_offset..end_offset].chars() {
+                                        current_width += ch2.to_string().width();
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        
+                        current_width += ch_width;
+                        
+                        // Remember positions after spaces for line breaking
+                        if ch == ' ' {
+                            last_break_pos = ch_byte_pos + 1;
+                        }
+                    }
+
+                    // Add the last segment
+                    let actual_end = if has_newline {
+                        byte_pos + line_str.len()
+                    } else {
+                        byte_pos + line_str.len()
+                    };
+                    
+                    if line_start < actual_end {
                         self.visual_lines.push(VisualLine {
                             start_byte: line_start,
-                            end_byte: break_pos,
+                            end_byte: actual_end,
                             is_continuation: !is_first_segment,
                             virtual_indent: if is_first_segment { 0 } else { continuation_indent },
                             is_virtual: false,
                         });
-                        
-                        is_first_segment = false;
-                        line_start = break_pos;
-                        
-                        // Don't skip whitespace - it belongs to the next visual line
-                        // This ensures no gaps in byte coverage
-                        
-                        current_width = 0;
-                        last_break_pos = line_start;
-                        
-                        // Recalculate current width after line break
-                        current_width = 0;
-                        if line_start <= ch_byte_pos {
-                            let start_offset = line_start - byte_pos;
-                            let end_offset = i + 1;
-                            if start_offset < end_offset && end_offset <= line.len() {
-                                for ch2 in line[start_offset..end_offset].chars() {
-                                    current_width += ch2.to_string().width();
-                                }
-                            }
-                        }
-                        continue;
+                    } else if line_start == actual_end && is_first_segment {
+                        // Empty line case
+                        self.visual_lines.push(VisualLine {
+                            start_byte: line_start,
+                            end_byte: line_start,
+                            is_continuation: false,
+                            virtual_indent: 0,
+                            is_virtual: false,
+                        });
                     }
-                    
-                    current_width += ch_width;
-                    
-                    // Remember positions after spaces for line breaking
-                    if ch == ' ' {
-                        last_break_pos = ch_byte_pos + 1;
-                    }
-                }
 
-                // Add the last segment
-                if line_start < byte_pos + line.len() {
-                    self.visual_lines.push(VisualLine {
-                        start_byte: line_start,
-                        end_byte: byte_pos + line.len(),
-                        is_continuation: !is_first_segment,
-                        virtual_indent: if is_first_segment { 0 } else { continuation_indent },
-                        is_virtual: false,
-                    });
-                } else if line_start == byte_pos + line.len() && is_first_segment {
-                    // Empty line case
-                    self.visual_lines.push(VisualLine {
-                        start_byte: line_start,
-                        end_byte: line_start,
-                        is_continuation: false,
-                        virtual_indent: 0,
-                        is_virtual: false,
-                    });
+                    byte_pos += line_bytes;
                 }
-
-                byte_pos += line.len() + 1;
             }
         }
         
         // Add virtual lines at the bottom
         for _ in 0..self.virtual_lines_count {
             self.visual_lines.push(VisualLine {
-                start_byte: self.buffer.content.len(),
-                end_byte: self.buffer.content.len(),
+                start_byte: self.buffer.len_bytes(),
+                end_byte: self.buffer.len_bytes(),
                 is_continuation: false,
                 virtual_indent: 0,
                 is_virtual: true,
@@ -373,9 +568,11 @@ impl Editor {
 
     fn get_caret_visual_position(&self) -> (usize, usize) {
         // Handle empty buffer case
-        if self.buffer.content.is_empty() {
+        if self.buffer.len_bytes() == 0 {
             return (self.virtual_lines_count, 0);
         }
+        
+        let rope_str = self.buffer.to_string();
         
         for (visual_row, vline) in self.visual_lines.iter().enumerate() {
             if vline.is_virtual {
@@ -384,7 +581,7 @@ impl Editor {
             
             // Check if caret is in this visual line's range
             if self.caret_byte >= vline.start_byte && self.caret_byte < vline.end_byte {
-                let line_content = &self.buffer.content[vline.start_byte..vline.end_byte];
+                let line_content = &rope_str[vline.start_byte..vline.end_byte];
                 let offset_in_line = self.caret_byte - vline.start_byte;
                 let col = line_content[..offset_in_line.min(line_content.len())].width() + vline.virtual_indent;
                 return (visual_row, col);
@@ -403,7 +600,7 @@ impl Editor {
                 };
                 
                 if is_last_line || next_is_new_line {
-                    let line_content = &self.buffer.content[vline.start_byte..vline.end_byte];
+                    let line_content = &rope_str[vline.start_byte..vline.end_byte];
                     let col = line_content.width() + vline.virtual_indent;
                     return (visual_row, col);
                 }
@@ -417,10 +614,11 @@ impl Editor {
     fn visual_row_col_to_byte(&self, visual_row: usize, target_col: usize) -> usize {
         if let Some(vline) = self.visual_lines.get(visual_row) {
             if vline.is_virtual {
-                return if visual_row < self.virtual_lines_count { 0 } else { self.buffer.content.len() };
+                return if visual_row < self.virtual_lines_count { 0 } else { self.buffer.len_bytes() };
             }
             
-            let line_content = &self.buffer.content[vline.start_byte..vline.end_byte];
+            let rope_str = self.buffer.to_string();
+            let line_content = &rope_str[vline.start_byte..vline.end_byte];
             
             if target_col < vline.virtual_indent {
                 return vline.start_byte;
@@ -441,7 +639,7 @@ impl Editor {
             
             vline.end_byte
         } else {
-            self.buffer.content.len()
+            self.buffer.len_bytes()
         }
     }
 
@@ -462,33 +660,39 @@ impl Editor {
 
     fn move_caret_left(&mut self) {
         if self.caret_byte > 0 {
-            let mut new_pos = self.caret_byte - 1;
-            while new_pos > 0 && !self.buffer.content.is_char_boundary(new_pos) {
-                new_pos -= 1;
+            let char_idx = self.buffer.rope.byte_to_char(self.caret_byte);
+            if char_idx > 0 {
+                self.caret_byte = self.buffer.rope.char_to_byte(char_idx - 1);
+                let (_, col) = self.get_caret_visual_position();
+                self.preferred_col = col;
             }
-            self.caret_byte = new_pos;
-            let (_, col) = self.get_caret_visual_position();
-            self.preferred_col = col;
         }
     }
 
     fn move_caret_right(&mut self) {
-        if self.caret_byte < self.buffer.content.len() {
-            let mut new_pos = self.caret_byte + 1;
-            while new_pos < self.buffer.content.len() && !self.buffer.content.is_char_boundary(new_pos) {
-                new_pos += 1;
+        if self.caret_byte < self.buffer.len_bytes() {
+            let char_idx = self.buffer.rope.byte_to_char(self.caret_byte);
+            if char_idx < self.buffer.rope.len_chars() {
+                self.caret_byte = self.buffer.rope.char_to_byte(char_idx + 1);
+                let (_, col) = self.get_caret_visual_position();
+                self.preferred_col = col;
             }
-            self.caret_byte = new_pos;
-            
-            // Update preferred column after moving
-            let (_, col) = self.get_caret_visual_position();
-            self.preferred_col = col;
         }
     }
 
     fn insert_char(&mut self, ch: char, viewport_width: usize) {
+        let caret_before = self.caret_byte;
         self.buffer.insert_char(self.caret_byte, ch);
         self.caret_byte += ch.len_utf8();
+        let caret_after = self.caret_byte;
+        
+        self.push_edit_operation(EditOperation::Insert {
+            position: caret_before,
+            text: ch.to_string(),
+            caret_before,
+            caret_after,
+        });
+        
         self.rebuild_visual_lines(viewport_width);
         let (_, col) = self.get_caret_visual_position();
         self.preferred_col = col;
@@ -496,40 +700,66 @@ impl Editor {
     }
 
     fn delete_char(&mut self, viewport_width: usize) {
-        self.buffer.delete_char(self.caret_byte);
-        self.rebuild_visual_lines(viewport_width);
-        self.modified = true;
-    }
-
-    fn backspace(&mut self, viewport_width: usize) {
-        if self.caret_byte > 0 {
-            let old_byte = self.caret_byte;
-            self.move_caret_left();
-            self.buffer.backspace(old_byte);
+        if let Some(ch) = self.buffer.delete_char(self.caret_byte) {
+            let caret_before = self.caret_byte;
+            let caret_after = self.caret_byte;
+            
+            self.push_edit_operation(EditOperation::Delete {
+                position: self.caret_byte,
+                text: ch.to_string(),
+                caret_before,
+                caret_after,
+            });
+            
             self.rebuild_visual_lines(viewport_width);
             self.modified = true;
         }
     }
 
+    fn backspace(&mut self, viewport_width: usize) {
+        if self.caret_byte > 0 {
+            if let Some((bytes_removed, ch)) = self.buffer.backspace(self.caret_byte) {
+                let caret_before = self.caret_byte;
+                self.caret_byte -= bytes_removed;
+                let caret_after = self.caret_byte;
+                
+                self.push_edit_operation(EditOperation::Delete {
+                    position: self.caret_byte,
+                    text: ch.to_string(),
+                    caret_before,
+                    caret_after,
+                });
+                
+                self.rebuild_visual_lines(viewport_width);
+                self.modified = true;
+            }
+        }
+    }
+
     fn insert_newline(&mut self, viewport_width: usize) {
-        self.buffer.insert_char(self.caret_byte, '\n');
-        self.caret_byte += 1;
+        self.insert_char('\n', viewport_width);
         self.preferred_col = 0;
-        self.rebuild_visual_lines(viewport_width);
-        self.modified = true;
     }
 
     fn indent_line(&mut self, viewport_width: usize) {
         let (line_idx, _, _) = self.buffer.byte_to_line_col(self.caret_byte);
         let line_start_byte = self.buffer.line_col_to_byte(line_idx, 0);
         
-        for i in 0..4 {
-            self.buffer.insert_char(line_start_byte + i, ' ');
-        }
+        let caret_before = self.caret_byte;
+        let indent_text = "    ";
+        self.buffer.insert_str(line_start_byte, indent_text);
         
         if self.caret_byte >= line_start_byte {
             self.caret_byte += 4;
         }
+        let caret_after = self.caret_byte;
+        
+        self.push_edit_operation(EditOperation::Insert {
+            position: line_start_byte,
+            text: indent_text.to_string(),
+            caret_before,
+            caret_after,
+        });
         
         self.rebuild_visual_lines(viewport_width);
         let (_, col) = self.get_caret_visual_position();
@@ -540,32 +770,41 @@ impl Editor {
     fn dedent_line(&mut self, viewport_width: usize) {
         let (line_idx, _, _) = self.buffer.byte_to_line_col(self.caret_byte);
         if let Some(line) = self.buffer.get_line(line_idx) {
-            let line_start_byte = self.buffer.line_col_to_byte(line_idx, 0);
-            
-            let mut spaces_to_remove = 0;
-            for ch in line.chars().take(4) {
-                if ch == ' ' {
-                    spaces_to_remove += 1;
-                } else {
-                    break;
-                }
-            }
-            
-            if spaces_to_remove > 0 {
-                for _ in 0..spaces_to_remove {
-                    self.buffer.delete_char(line_start_byte);
+            if let Some(line_str) = line.as_str() {
+                let line_start_byte = self.buffer.line_col_to_byte(line_idx, 0);
+                
+                let mut spaces_to_remove = 0;
+                for ch in line_str.chars().take(4) {
+                    if ch == ' ' {
+                        spaces_to_remove += 1;
+                    } else {
+                        break;
+                    }
                 }
                 
-                if self.caret_byte >= line_start_byte + spaces_to_remove {
-                    self.caret_byte -= spaces_to_remove;
-                } else if self.caret_byte > line_start_byte {
-                    self.caret_byte = line_start_byte;
+                if spaces_to_remove > 0 {
+                    let caret_before = self.caret_byte;
+                    let deleted_text = self.buffer.delete_range(line_start_byte, line_start_byte + spaces_to_remove);
+                    
+                    if self.caret_byte >= line_start_byte + spaces_to_remove {
+                        self.caret_byte -= spaces_to_remove;
+                    } else if self.caret_byte > line_start_byte {
+                        self.caret_byte = line_start_byte;
+                    }
+                    let caret_after = self.caret_byte;
+                    
+                    self.push_edit_operation(EditOperation::Delete {
+                        position: line_start_byte,
+                        text: deleted_text,
+                        caret_before,
+                        caret_after,
+                    });
+                    
+                    self.rebuild_visual_lines(viewport_width);
+                    let (_, col) = self.get_caret_visual_position();
+                    self.preferred_col = col;
+                    self.modified = true;
                 }
-                
-                self.rebuild_visual_lines(viewport_width);
-                let (_, col) = self.get_caret_visual_position();
-                self.preferred_col = col;
-                self.modified = true;
             }
         }
     }
@@ -715,6 +954,14 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                 KeyCode::Char('w') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                     editor.toggle_word_wrap(viewport_width);
                 }
+                KeyCode::Char('z') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                    editor.undo(viewport_width);
+                    editor.update_viewport(viewport_height, viewport_width);
+                }
+                KeyCode::Char('y') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                    editor.redo(viewport_width);
+                    editor.update_viewport(viewport_height, viewport_width);
+                }
                 KeyCode::Tab => {
                     if key.modifiers.contains(event::KeyModifiers::SHIFT) {
                         editor.dedent_line(viewport_width);
@@ -788,6 +1035,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
         } else if let Event::Resize(_, _) = event::read()? {
             let size = terminal.size()?;
             editor.rebuild_visual_lines(size.width as usize);
+            editor.update_viewport(size.height as usize - 1, size.width as usize);
+            terminal.clear()?;
         }
     }
 }
@@ -812,12 +1061,18 @@ fn ui(f: &mut Frame, editor: &mut Editor) {
     let start_row = editor.viewport_offset_row;
     let end_row = (start_row + viewport_height).min(editor.visual_lines.len());
     
+    let rope_str = editor.buffer.to_string();
+    
     for visual_row in start_row..end_row {
         if let Some(vline) = editor.visual_lines.get(visual_row) {
             if vline.is_virtual {
                 lines.push(Line::from(vec![Span::styled("~", Style::default().fg(Color::DarkGray))]));
             } else {
-                let line_content = &editor.buffer.content[vline.start_byte..vline.end_byte];
+                let line_content = if vline.end_byte <= rope_str.len() {
+                    &rope_str[vline.start_byte..vline.end_byte]
+                } else {
+                    ""
+                };
                 let mut spans = Vec::new();
                 
                 // Calculate the display content based on viewport offset
@@ -941,7 +1196,7 @@ fn ui(f: &mut Frame, editor: &mut Editor) {
     
     // Get logical line and column position
     let (logical_line, logical_col, _) = editor.buffer.byte_to_line_col(editor.caret_byte);
-    let total_lines = editor.buffer.lines.len();
+    let total_lines = editor.buffer.len_lines();
     
     // Create left side of status bar
     let left_status = format!(
@@ -960,7 +1215,7 @@ fn ui(f: &mut Frame, editor: &mut Editor) {
     let padding_len = status_width.saturating_sub(left_len + right_len);
     
     // Build the complete status bar
-    let mut status_spans = vec![
+    let status_spans = vec![
         Span::raw(left_status),
         Span::raw(" ".repeat(padding_len)),
         Span::raw(right_status),
