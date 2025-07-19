@@ -425,142 +425,157 @@ impl Editor {
         
         if !self.word_wrap {
             // Without word wrap, each logical line is a visual line
-            let mut byte_pos = 0;
             for line_idx in 0..self.buffer.len_lines() {
-                if let Some(line) = self.buffer.get_line(line_idx) {
-                    let line_bytes = line.len_bytes();
-                    let line_str = line.as_str().unwrap_or("");
-                    
-                    // Remove newline from end_byte calculation
-                    let visual_end_byte = if line_idx < self.buffer.len_lines() - 1 && line_str.ends_with('\n') {
-                        byte_pos + line_bytes - 1
-                    } else {
-                        byte_pos + line_bytes
-                    };
-                    
+                let line_start_char = self.buffer.rope.line_to_char(line_idx);
+                let line_end_char = if line_idx + 1 < self.buffer.len_lines() {
+                    self.buffer.rope.line_to_char(line_idx + 1)
+                } else {
+                    self.buffer.rope.len_chars()
+                };
+                
+                let line_start_byte = self.buffer.rope.char_to_byte(line_start_char);
+                let line_end_byte = self.buffer.rope.char_to_byte(line_end_char);
+                
+                // Check if line has a trailing newline
+                let line_slice = self.buffer.rope.slice(line_start_char..line_end_char);
+                let has_newline = line_slice.len_chars() > 0 && 
+                    line_slice.char(line_slice.len_chars() - 1) == '\n';
+                
+                let visual_end_byte = if has_newline {
+                    line_end_byte - 1
+                } else {
+                    line_end_byte
+                };
+                
+                self.visual_lines.push(VisualLine {
+                    start_byte: line_start_byte,
+                    end_byte: visual_end_byte,
+                    is_continuation: false,
+                    virtual_indent: 0,
+                    is_virtual: false,
+                });
+            }
+        } else {
+            // With word wrap - work with character indices, convert to bytes only when needed
+            for line_idx in 0..self.buffer.len_lines() {
+                let line_start_char = self.buffer.rope.line_to_char(line_idx);
+                let line_end_char = if line_idx + 1 < self.buffer.len_lines() {
+                    self.buffer.rope.line_to_char(line_idx + 1)
+                } else {
+                    self.buffer.rope.len_chars()
+                };
+                
+                // Get the line as a slice
+                let line_slice = self.buffer.rope.slice(line_start_char..line_end_char);
+                
+                // Handle empty lines
+                if line_slice.len_chars() == 0 {
+                    let byte_pos = self.buffer.rope.char_to_byte(line_start_char);
                     self.visual_lines.push(VisualLine {
                         start_byte: byte_pos,
-                        end_byte: visual_end_byte,
+                        end_byte: byte_pos,
                         is_continuation: false,
                         virtual_indent: 0,
                         is_virtual: false,
                     });
-                    byte_pos += line_bytes;
+                    continue;
                 }
-            }
-        } else {
-            // With word wrap
-            let mut byte_pos = 0;
-            for line_idx in 0..self.buffer.len_lines() {
-                if let Some(line_slice) = self.buffer.get_line(line_idx) {
-                    let line_str = line_slice.as_str().unwrap_or("");
-                    let continuation_indent = Self::calculate_indentation(line_str);
-                    let line_bytes = line_slice.len_bytes();
-                    
-                    // Remove newline from line content for processing
-                    let line_content = if line_idx < self.buffer.len_lines() - 1 && line_str.ends_with('\n') {
-                        &line_str[..line_str.len() - 1]
+                
+                // Get line as string for indentation calculation
+                let line_str = line_slice.to_string();
+                let continuation_indent = Self::calculate_indentation(&line_str);
+                
+                // Determine content length (excluding trailing newline)
+                let has_newline = line_slice.len_chars() > 0 && 
+                    line_slice.char(line_slice.len_chars() - 1) == '\n';
+                let content_len_chars = if has_newline {
+                    line_slice.len_chars() - 1
+                } else {
+                    line_slice.len_chars()
+                };
+                
+                // Handle lines with only a newline
+                if content_len_chars == 0 {
+                    let byte_pos = self.buffer.rope.char_to_byte(line_start_char);
+                    self.visual_lines.push(VisualLine {
+                        start_byte: byte_pos,
+                        end_byte: byte_pos,
+                        is_continuation: false,
+                        virtual_indent: 0,
+                        is_virtual: false,
+                    });
+                    continue;
+                }
+                
+                // Process line wrapping
+                let mut segment_start_char = 0;  // Relative to line start
+                let mut is_first_segment = true;
+                
+                while segment_start_char < content_len_chars {
+                    let effective_width = if is_first_segment {
+                        viewport_width
                     } else {
-                        line_str
+                        viewport_width.saturating_sub(continuation_indent)
                     };
                     
-                    if line_content.is_empty() {
-                        self.visual_lines.push(VisualLine {
-                            start_byte: byte_pos,
-                            end_byte: byte_pos + line_content.len(),
-                            is_continuation: false,
-                            virtual_indent: 0,
-                            is_virtual: false,
-                        });
-                        byte_pos += line_bytes;
-                        continue;
+                    if effective_width == 0 {
+                        break;
                     }
-
-                    let mut line_start = byte_pos;
+                    
+                    // Find break point by iterating through characters
                     let mut current_width = 0;
-                    let mut last_break_pos = line_start;
-                    let mut last_break_width = 0;
-                    let mut is_first_segment = true;
-
-                    for (i, ch) in line_content.char_indices() {
+                    let mut segment_end_char = segment_start_char;
+                    let mut last_break_char = segment_start_char;
+                    
+                    // Create a slice from the current position to the end of content
+                    let search_slice = line_slice.slice(segment_start_char..content_len_chars);
+                    
+                    for (idx, ch) in search_slice.chars().enumerate() {
                         let ch_width = ch.to_string().width();
-                        let ch_byte_pos = byte_pos + i;
                         
-                        let effective_viewport_width = if is_first_segment {
-                            viewport_width
-                        } else {
-                            viewport_width.saturating_sub(continuation_indent)
-                        };
-                        
-                        // Check if adding this character would exceed the width
-                        if current_width + ch_width > effective_viewport_width {
-                            // We need to break the line
-                            let break_pos = if last_break_pos > line_start {
-                                // We have a previous break position (space), use it
-                                last_break_pos
-                            } else if current_width == 0 {
-                                // Edge case: single character wider than viewport
-                                ch_byte_pos + ch.len_utf8()
+                        if current_width + ch_width > effective_width && idx > 0 {
+                            // Use last break point if available, otherwise break here
+                            segment_end_char = if last_break_char > segment_start_char {
+                                last_break_char
                             } else {
-                                // No previous break position, but we can't fit this character
-                                // Break before the current character to avoid splitting words
-                                ch_byte_pos
+                                segment_start_char + idx
                             };
-                            
-                            self.visual_lines.push(VisualLine {
-                                start_byte: line_start,
-                                end_byte: break_pos,
-                                is_continuation: !is_first_segment,
-                                virtual_indent: if is_first_segment { 0 } else { continuation_indent },
-                                is_virtual: false,
-                            });
-                            
-                            is_first_segment = false;
-                            line_start = break_pos;
-                            
-                            // Reset current width after break
-                            if last_break_pos > line_start.saturating_sub(1) {
-                                // We broke at a space, reset completely
-                                current_width = 0;
-                                last_break_pos = line_start;
-                                last_break_width = 0;
-                            } else {
-                                // We broke before current character, recalculate width
-                                current_width = 0;
-                                last_break_pos = line_start;
-                                last_break_width = 0;
-                                
-                                // Include current character in next line
-                                if line_start == ch_byte_pos {
-                                    current_width = ch_width;
-                                }
-                            }
-                            continue;
+                            break;
                         }
                         
                         current_width += ch_width;
                         
-                        // Remember positions after spaces or other break characters for line breaking
+                        // Track potential break points
                         if ch == ' ' || ch == '-' || ch == '/' {
-                            last_break_pos = ch_byte_pos + ch.len_utf8();
-                            last_break_width = current_width;
+                            last_break_char = segment_start_char + idx + 1;
                         }
+                        
+                        segment_end_char = segment_start_char + idx + 1;
                     }
-
-                    // Add the last segment
-                    let actual_end = byte_pos + line_content.len();
                     
-                    if line_start <= actual_end {
-                        self.visual_lines.push(VisualLine {
-                            start_byte: line_start,
-                            end_byte: actual_end,
-                            is_continuation: !is_first_segment,
-                            virtual_indent: if is_first_segment { 0 } else { continuation_indent },
-                            is_virtual: false,
-                        });
+                    // Convert character positions to byte positions
+                    let start_byte = self.buffer.rope.char_to_byte(line_start_char + segment_start_char);
+                    let end_byte = self.buffer.rope.char_to_byte(line_start_char + segment_end_char);
+                    
+                    self.visual_lines.push(VisualLine {
+                        start_byte,
+                        end_byte,
+                        is_continuation: !is_first_segment,
+                        virtual_indent: if is_first_segment { 0 } else { continuation_indent },
+                        is_virtual: false,
+                    });
+                    
+                    is_first_segment = false;
+                    segment_start_char = segment_end_char;
+                    
+                    // Skip leading spaces on continuation lines
+                    while segment_start_char < content_len_chars {
+                        let ch = line_slice.char(segment_start_char);
+                        if ch != ' ' {
+                            break;
+                        }
+                        segment_start_char += 1;
                     }
-
-                    byte_pos += line_bytes;
                 }
             }
         }
@@ -583,8 +598,6 @@ impl Editor {
             return (self.virtual_lines_count, 0);
         }
         
-        let rope_str = self.buffer.to_string();
-        
         for (visual_row, vline) in self.visual_lines.iter().enumerate() {
             if vline.is_virtual {
                 continue;
@@ -602,31 +615,38 @@ impl Editor {
                     }
                 }
                 
-                let mut line_content = &rope_str[vline.start_byte..vline.end_byte];
+                // Calculate column position using Rope's character API
+                let start_char = self.buffer.rope.byte_to_char(vline.start_byte);
+                let caret_char = self.buffer.rope.byte_to_char(self.caret_byte);
+                let chars_from_start = caret_char - start_char;
                 
-                // Strip trailing newline for position calculation
-                if line_content.ends_with('\n') {
-                    line_content = &line_content[..line_content.len() - 1];
+                // Calculate visual width
+                let line_slice = self.buffer.rope.slice(start_char..caret_char);
+                let mut col = vline.virtual_indent;
+                for ch in line_slice.chars() {
+                    col += ch.to_string().width();
                 }
                 
-                let offset_in_line = (self.caret_byte - vline.start_byte).min(line_content.len());
-                let col = line_content[..offset_in_line].width() + vline.virtual_indent;
                 return (visual_row, col);
             }
         }
         
         // If caret is at the very end of the buffer
-        if let Some(last_line) = self.visual_lines.iter().rev().find(|vl| !vl.is_virtual) {
-            let visual_row = self.visual_lines.iter().position(|vl| std::ptr::eq(vl, last_line)).unwrap();
-            let mut line_content = &rope_str[last_line.start_byte..last_line.end_byte];
+        if let Some((idx, last_line)) = self.visual_lines.iter()
+            .enumerate()
+            .rev()
+            .find(|(_, vl)| !vl.is_virtual) {
             
-            // Strip trailing newline for position calculation
-            if line_content.ends_with('\n') {
-                line_content = &line_content[..line_content.len() - 1];
+            let start_char = self.buffer.rope.byte_to_char(last_line.start_byte);
+            let end_char = self.buffer.rope.byte_to_char(last_line.end_byte);
+            let line_slice = self.buffer.rope.slice(start_char..end_char);
+            
+            let mut col = last_line.virtual_indent;
+            for ch in line_slice.chars() {
+                col += ch.to_string().width();
             }
             
-            let col = line_content.width() + last_line.virtual_indent;
-            return (visual_row, col);
+            return (idx, col);
         }
         
         // Fallback
@@ -639,34 +659,37 @@ impl Editor {
                 return if visual_row < self.virtual_lines_count { 0 } else { self.buffer.len_bytes() };
             }
             
-            let rope_str = self.buffer.to_string();
-            let mut line_content = &rope_str[vline.start_byte..vline.end_byte];
-            
-            // Strip trailing newline for position calculation
-            let has_newline = line_content.ends_with('\n');
-            if has_newline {
-                line_content = &line_content[..line_content.len() - 1];
-            }
-            
             if target_col < vline.virtual_indent {
                 return vline.start_byte;
             }
             
             let adjusted_target = target_col - vline.virtual_indent;
-            let mut current_col = 0;
-            let mut byte_offset = 0;
+            let start_char = self.buffer.rope.byte_to_char(vline.start_byte);
+            let end_char = self.buffer.rope.byte_to_char(vline.end_byte);
             
-            for ch in line_content.chars() {
+            // Check if line has a trailing newline we should ignore
+            let line_slice = self.buffer.rope.slice(start_char..end_char);
+            let content_end_char = if line_slice.len_chars() > 0 && 
+                line_slice.char(line_slice.len_chars() - 1) == '\n' {
+                end_char - 1
+            } else {
+                end_char
+            };
+            
+            // Find the character position at the target column
+            let mut current_col = 0;
+            let mut target_char = start_char;
+            
+            for ch in self.buffer.rope.slice(start_char..content_end_char).chars() {
                 if current_col >= adjusted_target {
-                    return vline.start_byte + byte_offset;
+                    break;
                 }
                 let ch_width = ch.to_string().width();
                 current_col += ch_width;
-                byte_offset += ch.len_utf8();
+                target_char += 1;
             }
             
-            // Return position at end of line content (before newline)
-            vline.start_byte + line_content.len()
+            self.buffer.rope.char_to_byte(target_char)
         } else {
             self.buffer.len_bytes()
         }
@@ -747,20 +770,32 @@ impl Editor {
 
     fn backspace(&mut self, viewport_width: usize) {
         if self.caret_byte > 0 {
-            if let Some((bytes_removed, ch)) = self.buffer.backspace(self.caret_byte) {
+            let char_idx = self.buffer.rope.byte_to_char(self.caret_byte);
+            if char_idx > 0 {
+                let prev_char_idx = char_idx - 1;
+                let ch = self.buffer.rope.char(prev_char_idx);
+                let ch_text = ch.to_string();
+                let delete_pos = self.buffer.rope.char_to_byte(prev_char_idx);
+                
+                // Store caret positions before the operation
                 let caret_before = self.caret_byte;
-                self.caret_byte -= bytes_removed;
-                let caret_after = self.caret_byte;
                 
-                self.push_edit_operation(EditOperation::Delete {
-                    position: self.caret_byte,
-                    text: ch.to_string(),
-                    caret_before,
-                    caret_after,
-                });
-                
-                self.rebuild_visual_lines(viewport_width);
-                self.modified = true;
+                // Perform the deletion
+                if let Some((bytes_removed, _)) = self.buffer.backspace(self.caret_byte) {
+                    self.caret_byte -= bytes_removed;
+                    let caret_after = self.caret_byte;
+                    
+                    // Create delete operation with correct position
+                    self.push_edit_operation(EditOperation::Delete {
+                        position: delete_pos,
+                        text: ch_text,
+                        caret_before,
+                        caret_after,
+                    });
+                    
+                    self.rebuild_visual_lines(viewport_width);
+                    self.modified = true;
+                }
             }
         }
     }
@@ -1090,28 +1125,30 @@ fn ui(f: &mut Frame, editor: &mut Editor) {
     let start_row = editor.viewport_offset_row;
     let end_row = (start_row + viewport_height).min(editor.visual_lines.len());
     
-    let rope_str = editor.buffer.to_string();
-    
     for visual_row in start_row..end_row {
         if let Some(vline) = editor.visual_lines.get(visual_row) {
             if vline.is_virtual {
                 lines.push(Line::from(vec![Span::styled("~", Style::default().fg(Color::DarkGray))]));
             } else {
-                let mut line_content = if vline.end_byte <= rope_str.len() {
-                    &rope_str[vline.start_byte..vline.end_byte]
-                } else {
-                    ""
-                };
+                // Use Rope's slice API to get the content
+                let start_char = editor.buffer.rope.byte_to_char(vline.start_byte);
+                let end_char = editor.buffer.rope.byte_to_char(vline.end_byte);
+                let line_slice = editor.buffer.rope.slice(start_char..end_char);
+                
+                // Convert slice to string - use to_string() which always works
+                let line_content = line_slice.to_string();
                 
                 // Strip trailing newline for display
-                if line_content.ends_with('\n') {
-                    line_content = &line_content[..line_content.len() - 1];
-                }
+                let display_content = if line_content.ends_with('\n') {
+                    &line_content[..line_content.len() - 1]
+                } else {
+                    &line_content
+                };
                 
                 // Calculate the display content based on viewport offset
-                let (display_content, display_offset) = if editor.word_wrap {
+                let (final_display_content, display_offset) = if editor.word_wrap {
                     // With word wrap, always show from the beginning of the visual line
-                    (line_content.to_string(), vline.virtual_indent)
+                    (display_content.to_string(), vline.virtual_indent)
                 } else {
                     // Without word wrap, we need to handle horizontal scrolling
                     let mut display = String::new();
@@ -1120,7 +1157,7 @@ fn ui(f: &mut Frame, editor: &mut Editor) {
                     let mut found_start = false;
                     
                     // First pass: find where to start displaying
-                    for ch in line_content.chars() {
+                    for ch in display_content.chars() {
                         let ch_width = ch.to_string().width();
                         
                         if !found_start && current_col + vline.virtual_indent >= editor.viewport_offset_col {
@@ -1157,7 +1194,7 @@ fn ui(f: &mut Frame, editor: &mut Editor) {
                     spans.push(Span::raw(" ".repeat(display_offset)));
                 }
                 
-                spans.push(Span::raw(display_content));
+                spans.push(Span::raw(final_display_content));
                 lines.push(Line::from(spans));
             }
         }
