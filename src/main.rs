@@ -998,17 +998,25 @@ impl Editor {
             for (op, before, _) in group.ops.iter().rev() {
                 match op {
                     EditOp::Insert { pos, text } => {
-                        let char_pos = self.rope.byte_to_char(*pos);
-                        self.rope.remove(char_pos..self.rope.byte_to_char(pos + text.len()));
+                        // Ensure positions are within bounds
+                        let safe_pos = (*pos).min(self.rope.len_bytes());
+                        let safe_end = (pos + text.len()).min(self.rope.len_bytes());
+                        if safe_pos < self.rope.len_bytes() && safe_end <= self.rope.len_bytes() {
+                            let char_pos = self.rope.byte_to_char(safe_pos);
+                            let char_end = self.rope.byte_to_char(safe_end);
+                            self.rope.remove(char_pos..char_end);
+                        }
                     }
                     EditOp::Delete { pos, text } => {
-                        self.rope.insert(self.rope.byte_to_char(*pos), text);
+                        let safe_pos = (*pos).min(self.rope.len_bytes());
+                        self.rope.insert(self.rope.byte_to_char(safe_pos), text);
                     }
                 }
                 caret = *before;
             }
             
-            self.caret = caret;
+            // Ensure caret is within valid bounds
+            self.caret = caret.min(self.rope.len_bytes());
             self.clear_selection();
             self.invalidate_visual_lines();
             self.logical_line_map.clear();
@@ -1024,17 +1032,25 @@ impl Editor {
             for (op, _, after) in &group.ops {
                 match op {
                     EditOp::Insert { pos, text } => {
-                        self.rope.insert(self.rope.byte_to_char(*pos), text);
+                        let safe_pos = (*pos).min(self.rope.len_bytes());
+                        self.rope.insert(self.rope.byte_to_char(safe_pos), text);
                     }
                     EditOp::Delete { pos, text } => {
-                        let char_pos = self.rope.byte_to_char(*pos);
-                        self.rope.remove(char_pos..self.rope.byte_to_char(pos + text.len()));
+                        // Ensure positions are within bounds
+                        let safe_pos = (*pos).min(self.rope.len_bytes());
+                        let safe_end = (pos + text.len()).min(self.rope.len_bytes());
+                        if safe_pos < self.rope.len_bytes() && safe_end <= self.rope.len_bytes() {
+                            let char_pos = self.rope.byte_to_char(safe_pos);
+                            let char_end = self.rope.byte_to_char(safe_end);
+                            self.rope.remove(char_pos..char_end);
+                        }
                     }
                 }
                 caret = *after;
             }
             
-            self.caret = caret;
+            // Ensure caret is within valid bounds
+            self.caret = caret.min(self.rope.len_bytes());
             self.clear_selection();
             self.invalidate_visual_lines();
             self.logical_line_map.clear();
@@ -1167,26 +1183,75 @@ impl Editor {
             let mut end = start;
             let mut last_break = start;
             
-            for (i, ch) in content[start..].chars().enumerate() {
+            let slice = if start <= content.len() {
+                content.chars().skip(content[..start].chars().count())
+            } else {
+                break;
+            };
+            
+            let mut char_offset = 0;
+            for ch in slice {
                 let ch_width = ch.to_string().width();
-                if width + ch_width > available_width && i > 0 {
-                    end = if last_break > start { last_break } else { start + i };
+                if width + ch_width > available_width && char_offset > 0 {
+                    end = if last_break > start { 
+                        last_break 
+                    } else {
+                        // Calculate the byte position for char_offset characters from start
+                        let mut byte_pos = start;
+                        for (idx, ch) in content[start..].chars().enumerate() {
+                            if idx >= char_offset {
+                                break;
+                            }
+                            byte_pos += ch.len_utf8();
+                        }
+                        byte_pos
+                    };
                     break;
                 }
                 
                 width += ch_width;
                 if ch == ' ' || ch == '-' || ch == '/' {
-                    last_break = start + i + ch.len_utf8();
+                    // Calculate byte position for the break point
+                    let mut byte_pos = start;
+                    for (idx, c) in content[start..].chars().enumerate() {
+                        if idx == char_offset {
+                            byte_pos += c.len_utf8();
+                            break;
+                        }
+                        byte_pos += c.len_utf8();
+                    }
+                    last_break = byte_pos;
                 }
-                end = start + i + ch.len_utf8();
+                
+                // Calculate end byte position
+                let mut byte_pos = start;
+                for (idx, c) in content[start..].chars().enumerate() {
+                    if idx == char_offset {
+                        byte_pos += c.len_utf8();
+                        break;
+                    }
+                    byte_pos += c.len_utf8();
+                }
+                end = byte_pos;
+                
+                char_offset += 1;
             }
             
             segments.push((start, end));
             start = end;
             is_first = false;
             
-            while start < content.len() && content.as_bytes()[start] == b' ' {
-                start += 1;
+            // Skip spaces at the beginning of the next line, respecting UTF-8 boundaries
+            while start < content.len() {
+                if let Some(ch) = content[start..].chars().next() {
+                    if ch == ' ' {
+                        start += ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
         }
         
@@ -1756,6 +1821,9 @@ impl Editor {
     fn replace_current(&mut self, replacement: &str, viewport_width: usize) {
         if let Some(idx) = self.current_match_index {
             if let Some(&(start, end)) = self.find_matches.get(idx) {
+                // Finalize any pending undo group before starting replace
+                self.finalize_undo_group();
+                
                 self.caret = start;
                 self.selection_anchor = Some(end);
                 
@@ -1763,6 +1831,11 @@ impl Editor {
                 for ch in replacement.chars() {
                     self.insert_char(ch, viewport_width);
                 }
+                
+                // Finalize the replace operation as its own undo group
+                self.finalize_undo_group();
+                // Reset last edit time to prevent timing issues with immediate undo
+                self.last_edit_time = None;
                 
                 let query = if let AppState::Prompting(ref prompt) = self.app_state {
                     prompt.input.clone()
@@ -1808,6 +1881,9 @@ impl Editor {
             return;
         }
 
+        // Finalize any pending undo group before starting replace all
+        self.finalize_undo_group();
+
         self.update_find_matches(query);
         
         while !self.find_matches.is_empty() {
@@ -1825,6 +1901,11 @@ impl Editor {
                 break;
             }
         }
+        
+        // Finalize the replace all operation as its own undo group
+        self.finalize_undo_group();
+        // Reset last edit time to prevent timing issues with immediate undo
+        self.last_edit_time = None;
     }
 
     fn refresh_find_matches_if_active(&mut self) {
@@ -1990,9 +2071,21 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                     FindReplaceField::Buffer => prompt.active_field = FindReplaceField::Find,
                                 }
                             }
+                            KeyCode::Char('z') if key.modifiers.contains(event::KeyModifiers::CONTROL) && matches!(prompt.prompt_type, PromptType::FindReplace) => {
+                                // Undo in main buffer
+                                editor.undo();
+                                editor.refresh_find_matches_if_active();
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Char('y') if key.modifiers.contains(event::KeyModifiers::CONTROL) && matches!(prompt.prompt_type, PromptType::FindReplace) => {
+                                // Redo in main buffer
+                                editor.redo();
+                                editor.refresh_find_matches_if_active();
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
                             KeyCode::Char('f') if key.modifiers.contains(event::KeyModifiers::CONTROL) && matches!(prompt.prompt_type, PromptType::FindReplace) => {
-                                if key.modifiers.contains(event::KeyModifiers::SHIFT) {
-                                    // Find previous
+                                if key.modifiers.contains(event::KeyModifiers::ALT) {
+                                    // Find previous (Ctrl+Alt+F)
                                     editor.find_previous();
                                 } else {
                                     // Find next
@@ -2000,9 +2093,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                 }
                                 editor.update_viewport(viewport_height, viewport_width);
                             }
-                            KeyCode::Char('h') if key.modifiers.contains(event::KeyModifiers::CONTROL) && matches!(prompt.prompt_type, PromptType::FindReplace) => {
-                                if key.modifiers.contains(event::KeyModifiers::SHIFT) {
-                                    // Replace all
+                            KeyCode::Char('r') if key.modifiers.contains(event::KeyModifiers::CONTROL) && matches!(prompt.prompt_type, PromptType::FindReplace) => {
+                                if key.modifiers.contains(event::KeyModifiers::ALT) {
+                                    // Replace all (Ctrl+Alt+R)
                                     let query = prompt.input.clone();
                                     let replacement = prompt.replace_input.clone();
                                     editor.replace_all(&query, &replacement, viewport_width);
@@ -2776,14 +2869,23 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                     String::new()
                 };
                 
+                let total_lines = editor.rope.len_lines();
+                let match_info = if editor.find_matches.is_empty() {
+                    "0 matches".to_string()
+                } else if let Some(current_idx) = editor.current_match_index {
+                    format!("{}/{} matches", current_idx + 1, editor.find_matches.len())
+                } else {
+                    format!("{} matches", editor.find_matches.len())
+                };
                 let status_text_fr = format!(
-                    " {} | {} | {}:{}{} | {} matches ",
+                    " {} | {} | {}/{}:{}{} | {} ",
                     editor.get_display_name(),
                     if editor.word_wrap { "Wrap" } else { "No-Wrap" },
                     line,
+                    total_lines,
                     col,
                     selection_info,
-                    editor.find_matches.len()
+                    match_info
                 );
                 
                 let status_fr = Paragraph::new(Line::from(vec![Span::raw(status_text_fr)]))
@@ -2834,11 +2936,13 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
         String::new()
     };
     
+    let total_lines = editor.rope.len_lines();
     let status_text = format!(
-        " {} | {} | {}:{}{} ",
+        " {} | {} | {}/{}:{}{} ",
         editor.get_display_name(),
         if editor.word_wrap { "Wrap" } else { "No-Wrap" },
         line,
+        total_lines,
         col,
         selection_info
     );
