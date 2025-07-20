@@ -8,9 +8,9 @@ use crossterm::{
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Style, Modifier},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame, Terminal,
 };
 use ropey::Rope;
@@ -30,7 +30,7 @@ struct VisualLine {
     end_byte: usize,
     is_continuation: bool,
     indent: usize,
-    logical_line: usize, // Track which logical line this belongs to
+    logical_line: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -40,20 +40,308 @@ enum EditOp {
 }
 
 struct UndoGroup {
-    ops: Vec<(EditOp, usize, usize)>, // (operation, caret_before, caret_after)
+    ops: Vec<(EditOp, usize, usize)>,
     timestamp: Instant,
+}
+
+#[derive(Debug, Clone)]
+enum PromptType {
+    SaveAs,
+    ConfirmSave,
+}
+
+struct Prompt {
+    prompt_type: PromptType,
+    message: String,
+    input: String,
+    cursor_pos: usize,
+    selection_anchor: Option<usize>,
+    clipboard: Clipboard,
+}
+
+impl Prompt {
+    fn new_save_as(default_path: String) -> Self {
+        let cursor_pos = default_path.len();
+        Self {
+            prompt_type: PromptType::SaveAs,
+            message: "Save as:".to_string(),
+            input: default_path,
+            cursor_pos,
+            selection_anchor: None,
+            clipboard: Clipboard::new().unwrap(),
+        }
+    }
+
+    fn new_confirm_save() -> Self {
+        Self {
+            prompt_type: PromptType::ConfirmSave,
+            message: "Save changes before closing? (y/n/c)".to_string(),
+            input: String::new(),
+            cursor_pos: 0,
+            selection_anchor: None,
+            clipboard: Clipboard::new().unwrap(),
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        self.selection_anchor.is_some()
+    }
+
+    fn get_selection_range(&self) -> Option<(usize, usize)> {
+        self.selection_anchor.map(|anchor| {
+            if anchor <= self.cursor_pos {
+                (anchor, self.cursor_pos)
+            } else {
+                (self.cursor_pos, anchor)
+            }
+        })
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        if let Some((start, end)) = self.get_selection_range() {
+            if start < end {
+                self.input.drain(start..end);
+                self.cursor_pos = start;
+                self.clear_selection();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn select_all(&mut self) {
+        if matches!(self.prompt_type, PromptType::SaveAs) {
+            self.selection_anchor = Some(0);
+            self.cursor_pos = self.input.len();
+        }
+    }
+
+    fn copy(&mut self) -> bool {
+        if let Some((start, end)) = self.get_selection_range() {
+            if start < end {
+                let text = self.input[start..end].to_string();
+                if let Err(_) = self.clipboard.set_text(text) {
+                    return false;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn cut(&mut self) -> bool {
+        if self.copy() {
+            self.delete_selection();
+            return true;
+        }
+        false
+    }
+
+    fn paste(&mut self) {
+        if matches!(self.prompt_type, PromptType::SaveAs) {
+            if let Ok(text) = self.clipboard.get_text() {
+                self.delete_selection();
+                self.input.insert_str(self.cursor_pos, &text);
+                self.cursor_pos += text.len();
+            }
+        }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        if matches!(self.prompt_type, PromptType::SaveAs) {
+            self.delete_selection();
+            self.input.insert(self.cursor_pos, ch);
+            self.cursor_pos += ch.len_utf8();
+        }
+    }
+
+    fn backspace(&mut self) {
+        if matches!(self.prompt_type, PromptType::SaveAs) {
+            if self.delete_selection() {
+                return;
+            }
+            
+            if self.cursor_pos > 0 {
+                let char_boundary = self.input
+                    .char_indices()
+                    .rev()
+                    .find(|(idx, _)| *idx < self.cursor_pos)
+                    .map(|(idx, ch)| (idx, ch.len_utf8()));
+                
+                if let Some((idx, _len)) = char_boundary {
+                    self.input.remove(idx);
+                    self.cursor_pos = idx;
+                }
+            }
+        }
+    }
+
+    fn delete(&mut self) {
+        if matches!(self.prompt_type, PromptType::SaveAs) {
+            if self.delete_selection() {
+                return;
+            }
+            
+            if self.cursor_pos < self.input.len() {
+                let char_boundary = self.input
+                    .char_indices()
+                    .find(|(idx, _)| *idx >= self.cursor_pos)
+                    .map(|(idx, ch)| (idx, ch.len_utf8()));
+                
+                if let Some((idx, len)) = char_boundary {
+                    self.input.drain(idx..idx + len);
+                }
+            }
+        }
+    }
+
+    fn move_cursor_left(&mut self, extend_selection: bool) {
+        if !extend_selection && self.has_selection() {
+            if let Some((start, _)) = self.get_selection_range() {
+                self.cursor_pos = start;
+                self.clear_selection();
+                return;
+            }
+        }
+
+        if extend_selection && self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor_pos);
+        } else if !extend_selection {
+            self.clear_selection();
+        }
+
+        if self.cursor_pos > 0 {
+            let new_pos = self.input
+                .char_indices()
+                .rev()
+                .find(|(idx, _)| *idx < self.cursor_pos)
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            self.cursor_pos = new_pos;
+        }
+    }
+
+    fn move_cursor_right(&mut self, extend_selection: bool) {
+        if !extend_selection && self.has_selection() {
+            if let Some((_, end)) = self.get_selection_range() {
+                self.cursor_pos = end;
+                self.clear_selection();
+                return;
+            }
+        }
+
+        if extend_selection && self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor_pos);
+        } else if !extend_selection {
+            self.clear_selection();
+        }
+
+        if self.cursor_pos < self.input.len() {
+            let new_pos = self.input
+                .char_indices()
+                .find(|(idx, _)| *idx > self.cursor_pos)
+                .map(|(idx, _)| idx)
+                .unwrap_or(self.input.len());
+            self.cursor_pos = new_pos;
+        }
+    }
+
+    fn move_cursor_home(&mut self, extend_selection: bool) {
+        if extend_selection && self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor_pos);
+        } else if !extend_selection {
+            self.clear_selection();
+        }
+        self.cursor_pos = 0;
+    }
+
+    fn move_cursor_end(&mut self, extend_selection: bool) {
+        if extend_selection && self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor_pos);
+        } else if !extend_selection {
+            self.clear_selection();
+        }
+        self.cursor_pos = self.input.len();
+    }
+
+    fn handle_click(&mut self, click_x: u16, area: Rect, shift_held: bool) {
+        if matches!(self.prompt_type, PromptType::SaveAs) {
+            let relative_x = click_x.saturating_sub(area.x) as usize;
+            
+            // Find the character position based on visual width
+            let mut visual_pos = 0;
+            let mut byte_pos = 0;
+            for (idx, ch) in self.input.char_indices() {
+                if visual_pos >= relative_x {
+                    byte_pos = idx;
+                    break;
+                }
+                visual_pos += ch.to_string().width();
+                byte_pos = idx + ch.len_utf8();
+            }
+            
+            if visual_pos < relative_x {
+                byte_pos = self.input.len();
+            }
+            
+            if shift_held {
+                if self.selection_anchor.is_none() {
+                    self.selection_anchor = Some(self.cursor_pos);
+                }
+                self.cursor_pos = byte_pos;
+            } else {
+                self.clear_selection();
+                self.cursor_pos = byte_pos;
+                self.selection_anchor = Some(self.cursor_pos);
+            }
+        }
+    }
+
+    fn handle_drag(&mut self, drag_x: u16, area: Rect) {
+        if matches!(self.prompt_type, PromptType::SaveAs) {
+            let relative_x = drag_x.saturating_sub(area.x) as usize;
+            
+            // Find the character position based on visual width
+            let mut visual_pos = 0;
+            let mut byte_pos = 0;
+            for (idx, ch) in self.input.char_indices() {
+                if visual_pos >= relative_x {
+                    byte_pos = idx;
+                    break;
+                }
+                visual_pos += ch.to_string().width();
+                byte_pos = idx + ch.len_utf8();
+            }
+            
+            if visual_pos < relative_x {
+                byte_pos = self.input.len();
+            }
+            
+            self.cursor_pos = byte_pos;
+        }
+    }
+}
+
+enum AppState {
+    Editing,
+    Prompting(Prompt),
+    Exiting,
 }
 
 struct Editor {
     rope: Rope,
     caret: usize,
-    selection_anchor: Option<usize>, // New field for selection
+    selection_anchor: Option<usize>,
     preferred_col: usize,
-    viewport_offset: (usize, usize), // (row, col)
+    viewport_offset: (usize, usize),
     word_wrap: bool,
-    visual_lines: Vec<Option<VisualLine>>, // None for virtual lines
-    visual_lines_valid: bool, // Track if visual lines need rebuilding
-    logical_line_map: Vec<(usize, usize)>, // Maps logical line index to (start, count) in visual_lines
+    visual_lines: Vec<Option<VisualLine>>,
+    visual_lines_valid: bool,
+    logical_line_map: Vec<(usize, usize)>,
     scrolloff: usize,
     virtual_lines: usize,
     filename: Option<PathBuf>,
@@ -62,12 +350,15 @@ struct Editor {
     redo_stack: Vec<UndoGroup>,
     current_group: Option<UndoGroup>,
     last_edit_time: Option<Instant>,
-    is_dragging: bool, // Track if mouse is being dragged
+    is_dragging: bool,
     clipboard: Clipboard,
+    current_dir: PathBuf,
+    app_state: AppState,
 }
 
 impl Editor {
     fn new() -> Self {
+        let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut editor = Self {
             rope: Rope::new(),
             caret: 0,
@@ -88,15 +379,52 @@ impl Editor {
             last_edit_time: None,
             is_dragging: false,
             clipboard: Clipboard::new().unwrap(),
+            current_dir,
+            app_state: AppState::Editing,
         };
         editor.invalidate_visual_lines();
         editor
     }
 
+    fn save(&mut self) -> io::Result<()> {
+        if let Some(ref path) = self.filename {
+            let content = self.rope.to_string();
+            fs::write(path, content)?;
+            self.modified = false;
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::Other, "No filename"))
+        }
+    }
+
+    fn save_as(&mut self, path: PathBuf) -> io::Result<()> {
+        let content = self.rope.to_string();
+        fs::write(&path, content)?;
+        self.filename = Some(path);
+        self.modified = false;
+        Ok(())
+    }
+
+    fn get_save_path_suggestion(&self) -> String {
+        if let Some(ref path) = self.filename {
+            path.to_string_lossy().to_string()
+        } else {
+            let mut path = self.current_dir.clone();
+            path.push("");
+            path.to_string_lossy().to_string()
+        }
+    }
+
     fn load_file(&mut self, path: PathBuf) -> io::Result<()> {
         let content = fs::read_to_string(&path)?;
         self.rope = Rope::from_str(&content);
-        self.filename = Some(path);
+        self.filename = Some(path.clone());
+        
+        // Update current directory to the file's directory
+        if let Some(parent) = path.parent() {
+            self.current_dir = parent.to_path_buf();
+        }
+        
         self.caret = 0;
         self.selection_anchor = None;
         self.preferred_col = 0;
@@ -199,7 +527,7 @@ impl Editor {
             self.caret = caret;
             self.clear_selection();
             self.invalidate_visual_lines();
-            self.logical_line_map.clear(); // Force rebuild of the map
+            self.logical_line_map.clear();
             self.redo_stack.push(group);
             self.modified = !self.undo_stack.is_empty();
         }
@@ -225,7 +553,7 @@ impl Editor {
             self.caret = caret;
             self.clear_selection();
             self.invalidate_visual_lines();
-            self.logical_line_map.clear(); // Force rebuild of the map
+            self.logical_line_map.clear();
             self.undo_stack.push(group);
             self.modified = true;
         }
@@ -235,12 +563,10 @@ impl Editor {
         let trimmed = line.trim_start();
         let base_indent = line.len() - trimmed.len();
         
-        // Check for list markers
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
             return base_indent + 4;
         }
         
-        // Check for numbered lists
         let mut chars = trimmed.chars();
         let mut num_count = 0;
         while let Some(ch) = chars.next() {
@@ -263,7 +589,6 @@ impl Editor {
         self.visual_lines.clear();
         self.logical_line_map.clear();
         
-        // Add virtual lines at the top
         for _ in 0..self.virtual_lines {
             self.visual_lines.push(None);
         }
@@ -277,7 +602,6 @@ impl Editor {
             let line_bytes = line.len_bytes();
             
             if !self.word_wrap {
-                // Without word wrap, each line is a visual line
                 let has_newline = line_str.ends_with('\n');
                 let end = byte_pos + line_bytes.saturating_sub(if has_newline { 1 } else { 0 });
                 
@@ -289,7 +613,6 @@ impl Editor {
                     logical_line: line_idx,
                 }));
             } else {
-                // With word wrap
                 let has_newline = line_str.ends_with('\n');
                 let content = if has_newline { &line_str[..line_str.len() - 1] } else { &line_str };
                 
@@ -323,7 +646,6 @@ impl Editor {
             byte_pos += line_bytes;
         }
         
-        // Add virtual lines at the bottom
         for _ in 0..self.virtual_lines {
             self.visual_lines.push(None);
         }
@@ -379,7 +701,6 @@ impl Editor {
             start = end;
             is_first = false;
             
-            // Skip leading spaces on continuation lines
             while start < content.len() && content.as_bytes()[start] == b' ' {
                 start += 1;
             }
@@ -397,18 +718,14 @@ impl Editor {
         
         for (row, vline) in self.visual_lines.iter().enumerate() {
             if let Some(vl) = vline {
-                // Check if we're at the exact end of this visual line
                 if byte_pos == vl.end_byte && row + 1 < self.visual_lines.len() {
-                    // Check if next line is a continuation
                     if let Some(Some(next_vl)) = self.visual_lines.get(row + 1) {
                         if next_vl.is_continuation && next_vl.start_byte == vl.end_byte {
-                            // Position cursor at start of continuation line
                             return (row + 1, next_vl.indent);
                         }
                     }
                 }
                 
-                // Normal case: cursor is within this visual line
                 if byte_pos >= vl.start_byte && byte_pos <= vl.end_byte {
                     let text = &self.rope.byte_slice(vl.start_byte..byte_pos).to_string();
                     let col = vl.indent + text.width();
@@ -417,7 +734,6 @@ impl Editor {
             }
         }
         
-        // Default to end
         if let Some((row, _)) = self.visual_lines.iter().enumerate().rev().find(|(_, vl)| vl.is_some()) {
             (row, 0)
         } else {
@@ -429,7 +745,6 @@ impl Editor {
         self.ensure_visual_lines(viewport_width);
         
         if let Some(Some(vline)) = self.visual_lines.get(row) {
-            // For continuation lines, if col is less than indent, position at line start
             if vline.is_continuation && col < vline.indent {
                 return vline.start_byte;
             }
@@ -465,7 +780,6 @@ impl Editor {
         if row > self.virtual_lines {
             self.caret = self.visual_to_byte(row - 1, self.preferred_col, viewport_width);
         } else if row == self.virtual_lines && self.rope.len_bytes() > 0 {
-            // If we're at the first content line, stay there
             self.caret = 0;
         }
     }
@@ -481,20 +795,17 @@ impl Editor {
         let total_visual_lines = self.visual_lines.len();
         let last_content_row = total_visual_lines - self.virtual_lines - 1;
         
-        // If we're in virtual lines at the top, move to first content line
         if row < self.virtual_lines && self.rope.len_bytes() > 0 {
             self.caret = 0;
             let (_, col) = self.get_visual_position(self.caret, viewport_width);
             self.preferred_col = col;
         } else if row < last_content_row {
-            // Normal case: move to next visual line
             self.caret = self.visual_to_byte(row + 1, self.preferred_col, viewport_width);
         }
     }
 
     fn move_left(&mut self, viewport_width: usize, extend_selection: bool) {
         if !extend_selection && self.has_selection() {
-            // Clear selection and move to start of selection
             if let Some((start, _)) = self.get_selection_range() {
                 self.caret = start;
                 self.clear_selection();
@@ -522,7 +833,6 @@ impl Editor {
 
     fn move_right(&mut self, viewport_width: usize, extend_selection: bool) {
         if !extend_selection && self.has_selection() {
-            // Clear selection and move to end of selection
             if let Some((_, end)) = self.get_selection_range() {
                 self.caret = end;
                 self.clear_selection();
@@ -549,7 +859,6 @@ impl Editor {
     }
 
     fn insert_char(&mut self, ch: char, viewport_width: usize) {
-        // Delete selection first if exists
         self.delete_selection();
 
         let before = self.caret;
@@ -558,7 +867,6 @@ impl Editor {
         
         self.push_op(EditOp::Insert { pos: before, text: ch.to_string() }, before, self.caret);
         
-        // For now, invalidate all visual lines to ensure correctness
         self.invalidate_visual_lines();
         
         let (_, col) = self.get_visual_position(self.caret, viewport_width);
@@ -566,7 +874,6 @@ impl Editor {
     }
 
     fn delete(&mut self, _viewport_width: usize) {
-        // If there's a selection, delete it
         if self.delete_selection() {
             return;
         }
@@ -580,14 +887,12 @@ impl Editor {
                 
                 self.push_op(EditOp::Delete { pos: self.caret, text: ch.to_string() }, before, self.caret);
                 
-                // For now, invalidate all visual lines to ensure correctness
                 self.invalidate_visual_lines();
             }
         }
     }
 
     fn backspace(&mut self, _viewport_width: usize) {
-        // If there's a selection, delete it
         if self.delete_selection() {
             return;
         }
@@ -604,7 +909,6 @@ impl Editor {
                 
                 self.push_op(EditOp::Delete { pos: self.caret, text: ch.to_string() }, before, self.caret);
                 
-                // For now, invalidate all visual lines to ensure correctness
                 self.invalidate_visual_lines();
             }
         }
@@ -624,7 +928,6 @@ impl Editor {
         
         self.push_op(EditOp::Insert { pos: line_byte, text: "    ".to_string() }, before, self.caret);
         
-        // For now, invalidate all visual lines to ensure correctness
         self.invalidate_visual_lines();
         
         let (_, col) = self.get_visual_position(self.caret, viewport_width);
@@ -660,7 +963,6 @@ impl Editor {
             
             self.push_op(EditOp::Delete { pos: line_byte, text: " ".repeat(spaces) }, before, self.caret);
             
-            // For now, invalidate all visual lines to ensure correctness
             self.invalidate_visual_lines();
             
             let (_, col) = self.get_visual_position(self.caret, viewport_width);
@@ -696,7 +998,6 @@ impl Editor {
 
     fn paste(&mut self, viewport_width: usize) {
         if let Ok(text) = self.clipboard.get_text() {
-            // Delete selection first if exists
             self.delete_selection();
             
             let before = self.caret;
@@ -718,14 +1019,12 @@ impl Editor {
         self.ensure_visual_lines(width);
         let (row, col) = self.get_visual_position(self.caret, width);
         
-        // Vertical scrolling
         if row < self.viewport_offset.0 + self.scrolloff {
             self.viewport_offset.0 = row.saturating_sub(self.scrolloff);
         } else if row >= self.viewport_offset.0 + height - self.scrolloff {
             self.viewport_offset.0 = row + self.scrolloff + 1 - height;
         }
         
-        // Horizontal scrolling (only without word wrap)
         if !self.word_wrap {
             if col < self.viewport_offset.1 + self.scrolloff {
                 self.viewport_offset.1 = col.saturating_sub(self.scrolloff);
@@ -744,10 +1043,8 @@ impl Editor {
         
         if click_row >= self.virtual_lines && 
            click_row < self.visual_lines.len() - self.virtual_lines {
-            // Get the visual line to check for continuation constraints
             if let Some(Some(vline)) = self.visual_lines.get(click_row) {
                 let actual_col = if vline.is_continuation {
-                    // Ensure we don't click before the indent on continuation lines
                     click_col.max(vline.indent)
                 } else {
                     click_col
@@ -755,13 +1052,11 @@ impl Editor {
                 let new_pos = self.visual_to_byte(click_row, actual_col, viewport_width);
                 
                 if shift_held {
-                    // Shift+click: extend selection
                     if self.selection_anchor.is_none() {
                         self.selection_anchor = Some(self.caret);
                     }
                     self.caret = new_pos;
                 } else {
-                    // Regular click: clear selection and move caret
                     self.clear_selection();
                     self.caret = new_pos;
                 }
@@ -822,7 +1117,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     let mut editor = Editor::new();
     
-    // Load file from command line
     if let Some(filename) = env::args().nth(1) {
         let path = PathBuf::from(filename);
         editor.filename = Some(path.clone());
@@ -837,156 +1131,319 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     loop {
         terminal.draw(|f| draw_ui(f, &mut editor))?;
         
+        if let AppState::Exiting = editor.app_state {
+            return Ok(());
+        }
+        
         match event::read()? {
             Event::Key(key) => {
                 let size = terminal.size()?;
                 let viewport_width = size.width as usize;
                 let viewport_height = size.height as usize - 1;
                 
-                match key.code {
-                    KeyCode::Char('q') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                        return Ok(());
-                    }
-                    KeyCode::Char('a') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                        editor.select_all();
-                        editor.update_viewport(viewport_height, viewport_width);
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                        editor.copy();
-                    }
-                    KeyCode::Char('x') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                        if editor.cut() {
-                            editor.update_viewport(viewport_height, viewport_width);
-                        }
-                    }
-                    KeyCode::Char('v') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                        editor.paste(viewport_width);
-                        editor.update_viewport(viewport_height, viewport_width);
-                    }
-                    KeyCode::Char('w') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                        editor.word_wrap = !editor.word_wrap;
-                        editor.invalidate_visual_lines();
-                        editor.logical_line_map.clear(); // Word wrap changes all visual lines
-                    }
-                    KeyCode::Char('z') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                        editor.undo();
-                        editor.update_viewport(viewport_height, viewport_width);
-                    }
-                    KeyCode::Char('y') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                        editor.redo();
-                        editor.update_viewport(viewport_height, viewport_width);
-                    }
-                    KeyCode::Tab => {
-                        if key.modifiers.contains(event::KeyModifiers::SHIFT) {
-                            editor.dedent(viewport_width);
-                        } else {
-                            editor.indent(viewport_width);
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        editor.insert_char(c, viewport_width);
-                        editor.update_viewport(viewport_height, viewport_width);
-                    }
-                    KeyCode::Enter => {
-                        editor.insert_char('\n', viewport_width);
-                        editor.preferred_col = 0;
-                        editor.update_viewport(viewport_height, viewport_width);
-                    }
-                    KeyCode::Backspace => {
-                        editor.backspace(viewport_width);
-                        editor.update_viewport(viewport_height, viewport_width);
-                    }
-                    KeyCode::Delete => {
-                        editor.delete(viewport_width);
-                        editor.update_viewport(viewport_height, viewport_width);
-                    }
-                    KeyCode::Left => {
-                        editor.move_left(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
-                        editor.update_viewport(viewport_height, viewport_width);
-                    }
-                    KeyCode::Right => {
-                        editor.move_right(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
-                        editor.update_viewport(viewport_height, viewport_width);
-                    }
-                    KeyCode::Up => {
-                        editor.move_up(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
-                        editor.update_viewport(viewport_height, viewport_width);
-                    }
-                    KeyCode::Down => {
-                        editor.move_down(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
-                        editor.update_viewport(viewport_height, viewport_width);
-                    }
-                    _ => {}
-                }
-                
-                execute!(io::stdout(), SetTitle(&editor.get_display_name()))?;
-            }
-            Event::Mouse(mouse) => {
-                let size = terminal.size()?;
-                match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let chunks = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([
-                                Constraint::Min(0),
-                                Constraint::Length(1),
-                            ])
-                            .split(size);
-                        
-                        let shift_held = mouse.modifiers.contains(event::KeyModifiers::SHIFT);
-                        editor.handle_click(mouse.column, mouse.row, chunks[0], size.width as usize, shift_held);
-                        
-                        // Start dragging
-                        editor.is_dragging = true;
-                        if !shift_held {
-                            editor.selection_anchor = Some(editor.caret);
-                        }
-                    }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        if editor.is_dragging {
-                            let chunks = Layout::default()
-                                .direction(Direction::Vertical)
-                                .constraints([
-                                    Constraint::Min(0),
-                                    Constraint::Length(1),
-                                ])
-                                .split(size);
-                            
-                            // Update caret position but keep selection anchor
-                            let click_row = editor.viewport_offset.0 + mouse.row.saturating_sub(chunks[0].y) as usize;
-                            let click_col = editor.viewport_offset.1 + mouse.column.saturating_sub(chunks[0].x) as usize;
-                            
-                            if click_row >= editor.virtual_lines && 
-                               click_row < editor.visual_lines.len() - editor.virtual_lines {
-                                if let Some(Some(vline)) = editor.visual_lines.get(click_row) {
-                                    let actual_col = if vline.is_continuation {
-                                        click_col.max(vline.indent)
-                                    } else {
-                                        click_col
-                                    };
-                                    editor.caret = editor.visual_to_byte(click_row, actual_col, size.width as usize);
-                                    editor.preferred_col = actual_col;
+                match &mut editor.app_state {
+                    AppState::Prompting(prompt) => {
+                        match key.code {
+                            KeyCode::Esc => {
+                                editor.app_state = AppState::Editing;
+                            }
+                            KeyCode::Enter => {
+                                match prompt.prompt_type {
+                                    PromptType::SaveAs => {
+                                        if !prompt.input.is_empty() {
+                                            let path = PathBuf::from(&prompt.input);
+                                            if let Err(e) = editor.save_as(path) {
+                                                // TODO: Show error message
+                                                eprintln!("Save failed: {:?}", e);
+                                            } else {
+                                                execute!(io::stdout(), SetTitle(&editor.get_display_name()))?;
+                                            }
+                                            editor.app_state = AppState::Editing;
+                                        }
+                                    }
+                                    PromptType::ConfirmSave => {
+                                        // Handle in the key event below
+                                    }
                                 }
                             }
+                            KeyCode::Char('a') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                prompt.select_all();
+                            }
+                            KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                prompt.copy();
+                            }
+                            KeyCode::Char('x') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                prompt.cut();
+                            }
+                            KeyCode::Char('v') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                prompt.paste();
+                            }
+                            KeyCode::Char(ch) => {
+                                match prompt.prompt_type {
+                                    PromptType::ConfirmSave => {
+                                        match ch.to_ascii_lowercase() {
+                                            'y' => {
+                                                if editor.filename.is_some() {
+                                                    if let Err(e) = editor.save() {
+                                                        eprintln!("Save failed: {:?}", e);
+                                                    }
+                                                    editor.app_state = AppState::Exiting;
+                                                } else {
+                                                    let path = editor.get_save_path_suggestion();
+                                                    editor.app_state = AppState::Prompting(Prompt::new_save_as(path));
+                                                }
+                                            }
+                                            'n' => {
+                                                editor.app_state = AppState::Exiting;
+                                            }
+                                            'c' => {
+                                                editor.app_state = AppState::Editing;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    _ => {
+                                        prompt.insert_char(ch);
+                                    }
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                prompt.backspace();
+                            }
+                            KeyCode::Delete => {
+                                prompt.delete();
+                            }
+                            KeyCode::Left => {
+                                prompt.move_cursor_left(key.modifiers.contains(event::KeyModifiers::SHIFT));
+                            }
+                            KeyCode::Right => {
+                                prompt.move_cursor_right(key.modifiers.contains(event::KeyModifiers::SHIFT));
+                            }
+                            KeyCode::Home => {
+                                prompt.move_cursor_home(key.modifiers.contains(event::KeyModifiers::SHIFT));
+                            }
+                            KeyCode::End => {
+                                prompt.move_cursor_end(key.modifiers.contains(event::KeyModifiers::SHIFT));
+                            }
+                            _ => {}
                         }
                     }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        editor.is_dragging = false;
+                    AppState::Editing => {
+                        match key.code {
+                            KeyCode::Char('q') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                if editor.modified {
+                                    editor.app_state = AppState::Prompting(Prompt::new_confirm_save());
+                                } else {
+                                    return Ok(());
+                                }
+                            }
+                            KeyCode::Char('s') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                if key.modifiers.contains(event::KeyModifiers::SHIFT) || key.modifiers.contains(event::KeyModifiers::ALT) {
+                                    // Save As (Ctrl+Shift+S or Ctrl+Alt+S)
+                                    let path = editor.get_save_path_suggestion();
+                                    editor.app_state = AppState::Prompting(Prompt::new_save_as(path));
+                                } else {
+                                    // Save (Ctrl+S)
+                                    if editor.filename.is_some() {
+                                        if let Err(e) = editor.save() {
+                                            eprintln!("Save failed: {:?}", e);
+                                        } else {
+                                            execute!(io::stdout(), SetTitle(&editor.get_display_name()))?;
+                                        }
+                                    } else {
+                                        let path = editor.get_save_path_suggestion();
+                                        editor.app_state = AppState::Prompting(Prompt::new_save_as(path));
+                                    }
+                                }
+                            }
+                            KeyCode::F(12) => {
+                                // Save As (F12) - Alternative to Ctrl+Shift+S
+                                let path = editor.get_save_path_suggestion();
+                                editor.app_state = AppState::Prompting(Prompt::new_save_as(path));
+                            }
+                            KeyCode::Char('a') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                editor.select_all();
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                editor.copy();
+                            }
+                            KeyCode::Char('x') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                if editor.cut() {
+                                    editor.update_viewport(viewport_height, viewport_width);
+                                }
+                            }
+                            KeyCode::Char('v') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                editor.paste(viewport_width);
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Char('w') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                editor.word_wrap = !editor.word_wrap;
+                                editor.invalidate_visual_lines();
+                                editor.logical_line_map.clear();
+                            }
+                            KeyCode::Char('z') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                editor.undo();
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Char('y') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                editor.redo();
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Tab => {
+                                if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                    editor.dedent(viewport_width);
+                                } else {
+                                    editor.indent(viewport_width);
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                editor.insert_char(c, viewport_width);
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Enter => {
+                                editor.insert_char('\n', viewport_width);
+                                editor.preferred_col = 0;
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Backspace => {
+                                editor.backspace(viewport_width);
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Delete => {
+                                editor.delete(viewport_width);
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Left => {
+                                editor.move_left(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Right => {
+                                editor.move_right(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Up => {
+                                editor.move_up(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Down => {
+                                editor.move_down(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            _ => {}
+                        }
+                        
+                        execute!(io::stdout(), SetTitle(&editor.get_display_name()))?;
                     }
-                    MouseEventKind::ScrollUp => {
-                        editor.viewport_offset.0 = editor.viewport_offset.0.saturating_sub(3);
+                    AppState::Exiting => {}
+                }
+            }
+            Event::Mouse(mouse) => {
+                match &mut editor.app_state {
+                    AppState::Prompting(prompt) => {
+                        // Get the prompt area coordinates
+                        let area = centered_rect(60, 20, terminal.size()?);
+                        let inner = Block::default()
+                            .borders(Borders::ALL)
+                            .inner(area);
+                        
+                        let input_area = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([
+                                Constraint::Length(1),
+                                Constraint::Length(1),
+                                Constraint::Min(1),
+                            ])
+                            .split(inner);
+                        
+                        let input_y = input_area[1].y;
+                        
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                if mouse.row == input_y && 
+                                   mouse.column >= inner.x && 
+                                   mouse.column < inner.x + inner.width {
+                                    let shift_held = mouse.modifiers.contains(event::KeyModifiers::SHIFT);
+                                    prompt.handle_click(mouse.column, inner, shift_held);
+                                }
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                if mouse.row == input_y &&
+                                   mouse.column >= inner.x && 
+                                   mouse.column < inner.x + inner.width {
+                                    prompt.handle_drag(mouse.column, inner);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
-                    MouseEventKind::ScrollDown => {
-                        let max = editor.visual_lines.len().saturating_sub(size.height as usize - 1);
-                        editor.viewport_offset.0 = (editor.viewport_offset.0 + 3).min(max);
+                    AppState::Editing => {
+                        let size = terminal.size()?;
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                let chunks = Layout::default()
+                                    .direction(Direction::Vertical)
+                                    .constraints([
+                                        Constraint::Min(0),
+                                        Constraint::Length(1),
+                                    ])
+                                    .split(size);
+                                
+                                let shift_held = mouse.modifiers.contains(event::KeyModifiers::SHIFT);
+                                editor.handle_click(mouse.column, mouse.row, chunks[0], size.width as usize, shift_held);
+                                
+                                editor.is_dragging = true;
+                                if !shift_held {
+                                    editor.selection_anchor = Some(editor.caret);
+                                }
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                if editor.is_dragging {
+                                    let chunks = Layout::default()
+                                        .direction(Direction::Vertical)
+                                        .constraints([
+                                            Constraint::Min(0),
+                                            Constraint::Length(1),
+                                        ])
+                                        .split(size);
+                                    
+                                    let click_row = editor.viewport_offset.0 + mouse.row.saturating_sub(chunks[0].y) as usize;
+                                    let click_col = editor.viewport_offset.1 + mouse.column.saturating_sub(chunks[0].x) as usize;
+                                    
+                                    if click_row >= editor.virtual_lines && 
+                                       click_row < editor.visual_lines.len() - editor.virtual_lines {
+                                        if let Some(Some(vline)) = editor.visual_lines.get(click_row) {
+                                            let actual_col = if vline.is_continuation {
+                                                click_col.max(vline.indent)
+                                            } else {
+                                                click_col
+                                            };
+                                            editor.caret = editor.visual_to_byte(click_row, actual_col, size.width as usize);
+                                            editor.preferred_col = actual_col;
+                                        }
+                                    }
+                                }
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                editor.is_dragging = false;
+                            }
+                            MouseEventKind::ScrollUp => {
+                                editor.viewport_offset.0 = editor.viewport_offset.0.saturating_sub(3);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                let max = editor.visual_lines.len().saturating_sub(size.height as usize - 1);
+                                editor.viewport_offset.0 = (editor.viewport_offset.0 + 3).min(max);
+                            }
+                            _ => {}
+                        }
                     }
-                    _ => {}
+                    AppState::Exiting => {}
                 }
             }
             Event::Resize(_, _) => {
                 let size = terminal.size()?;
                 editor.invalidate_visual_lines();
-                editor.logical_line_map.clear(); // Resize can change all line wrapping
+                editor.logical_line_map.clear();
                 editor.update_viewport(size.height as usize - 1, size.width as usize);
             }
             _ => {}
@@ -1006,14 +1463,11 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     let viewport_height = chunks[0].height as usize;
     let viewport_width = chunks[0].width as usize;
     
-    // Ensure visual lines are built before updating viewport
     editor.ensure_visual_lines(viewport_width);
     editor.update_viewport(viewport_height, viewport_width);
     
-    // Get selection range
     let selection_range = editor.get_selection_range();
     
-    // Render main text area
     let mut lines = Vec::new();
     let (caret_row, caret_col) = editor.get_visual_position(editor.caret, viewport_width);
     
@@ -1025,7 +1479,6 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
             if let Some(vline) = vline_opt {
                 let text = editor.rope.byte_slice(vline.start_byte..vline.end_byte).to_string();
                 
-                // Apply horizontal scrolling if needed
                 let display_text = if editor.word_wrap || editor.viewport_offset.1 == 0 {
                     text
                 } else {
@@ -1046,13 +1499,11 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                     spans.push(Span::raw(" ".repeat(vline.indent)));
                 }
                 
-                // Handle selection highlighting
                 if let Some((sel_start, sel_end)) = selection_range {
                     let line_start = vline.start_byte;
                     let line_end = vline.end_byte;
                     
                     if sel_end > line_start && sel_start < line_end {
-                        // This line contains part of the selection
                         let mut byte_pos = 0;
                         for ch in display_text.chars() {
                             let ch_str = ch.to_string();
@@ -1076,13 +1527,11 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                 
                 lines.push(Line::from(spans));
             } else {
-                // Virtual line
                 lines.push(Line::from(vec![Span::styled("~", Style::default().fg(Color::DarkGray))]));
             }
         }
     }
     
-    // Pad with empty lines if needed
     while lines.len() < viewport_height {
         lines.push(Line::default());
     }
@@ -1090,24 +1539,90 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, chunks[0]);
     
-    // Set cursor position
-    if caret_row >= start && caret_row < end {
-        let screen_row = caret_row - start;
-        let screen_col = if editor.word_wrap {
-            caret_col
-        } else {
-            caret_col.saturating_sub(editor.viewport_offset.1)
-        };
+    // Draw prompt if active
+    if let AppState::Prompting(prompt) = &editor.app_state {
+        let area = centered_rect(60, 20, f.size());
+        f.render_widget(Clear, area);
         
-        if screen_col < viewport_width {
-            f.set_cursor(
-                chunks[0].x + screen_col as u16,
-                chunks[0].y + screen_row as u16,
-            );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(match prompt.prompt_type {
+                PromptType::SaveAs => "Save As",
+                PromptType::ConfirmSave => "Unsaved Changes",
+            })
+            .style(Style::default().bg(Color::Black));
+        
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        
+        match prompt.prompt_type {
+            PromptType::SaveAs => {
+                let input_area = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Min(1),
+                    ])
+                    .split(inner);
+                
+                let message = Paragraph::new(prompt.message.as_str());
+                f.render_widget(message, input_area[0]);
+                
+                // Render input with selection highlighting
+                let mut spans = vec![];
+                if let Some((sel_start, sel_end)) = prompt.get_selection_range() {
+                    for (idx, ch) in prompt.input.char_indices() {
+                        let ch_str = ch.to_string();
+                        if idx >= sel_start && idx < sel_end {
+                            spans.push(Span::styled(ch_str, Style::default().bg(Color::Blue).fg(Color::White)));
+                        } else {
+                            spans.push(Span::raw(ch_str));
+                        }
+                    }
+                } else {
+                    spans.push(Span::raw(&prompt.input));
+                }
+                
+                let input = Paragraph::new(Line::from(spans))
+                    .style(Style::default().add_modifier(Modifier::UNDERLINED));
+                f.render_widget(input, input_area[1]);
+                
+                // Set cursor position in prompt
+                let mut visual_cursor_pos = 0;
+                for (idx, ch) in prompt.input.char_indices() {
+                    if idx >= prompt.cursor_pos {
+                        break;
+                    }
+                    visual_cursor_pos += ch.to_string().width();
+                }
+                let cursor_x = inner.x + visual_cursor_pos.min(inner.width as usize - 1) as u16;
+                f.set_cursor(cursor_x, input_area[1].y);
+            }
+            PromptType::ConfirmSave => {
+                let message = Paragraph::new(prompt.message.as_str());
+                f.render_widget(message, inner);
+            }
+        }
+    } else {
+        // Set cursor position in editor
+        if caret_row >= start && caret_row < end {
+            let screen_row = caret_row - start;
+            let screen_col = if editor.word_wrap {
+                caret_col
+            } else {
+                caret_col.saturating_sub(editor.viewport_offset.1)
+            };
+            
+            if screen_col < viewport_width {
+                f.set_cursor(
+                    chunks[0].x + screen_col as u16,
+                    chunks[0].y + screen_row as u16,
+                );
+            }
         }
     }
     
-    // Set cursor style based on selection state
     let cursor_style = if editor.has_selection() {
         SetCursorStyle::SteadyUnderScore
     } else {
@@ -1141,4 +1656,24 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
         .alignment(Alignment::Left);
     
     f.render_widget(status, chunks[1]);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
