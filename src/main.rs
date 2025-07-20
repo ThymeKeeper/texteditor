@@ -1,3 +1,4 @@
+use arboard::Clipboard;
 use crossterm::{
     cursor::SetCursorStyle,
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEventKind, MouseButton},
@@ -62,6 +63,7 @@ struct Editor {
     current_group: Option<UndoGroup>,
     last_edit_time: Option<Instant>,
     is_dragging: bool, // Track if mouse is being dragged
+    clipboard: Clipboard,
 }
 
 impl Editor {
@@ -85,6 +87,7 @@ impl Editor {
             current_group: None,
             last_edit_time: None,
             is_dragging: false,
+            clipboard: Clipboard::new().unwrap(),
         };
         editor.invalidate_visual_lines();
         editor
@@ -562,7 +565,7 @@ impl Editor {
         self.preferred_col = col;
     }
 
-    fn delete(&mut self, viewport_width: usize) {
+    fn delete(&mut self, _viewport_width: usize) {
         // If there's a selection, delete it
         if self.delete_selection() {
             return;
@@ -583,7 +586,7 @@ impl Editor {
         }
     }
 
-    fn backspace(&mut self, viewport_width: usize) {
+    fn backspace(&mut self, _viewport_width: usize) {
         // If there's a selection, delete it
         if self.delete_selection() {
             return;
@@ -658,6 +661,52 @@ impl Editor {
             self.push_op(EditOp::Delete { pos: line_byte, text: " ".repeat(spaces) }, before, self.caret);
             
             // For now, invalidate all visual lines to ensure correctness
+            self.invalidate_visual_lines();
+            
+            let (_, col) = self.get_visual_position(self.caret, viewport_width);
+            self.preferred_col = col;
+        }
+    }
+
+    fn select_all(&mut self) {
+        self.selection_anchor = Some(0);
+        self.caret = self.rope.len_bytes();
+    }
+
+    fn copy(&mut self) -> bool {
+        if let Some((start, end)) = self.get_selection_range() {
+            if start < end {
+                let text = self.rope.byte_slice(start..end).to_string();
+                if let Err(_) = self.clipboard.set_text(text) {
+                    return false;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn cut(&mut self) -> bool {
+        if self.copy() {
+            self.delete_selection();
+            return true;
+        }
+        false
+    }
+
+    fn paste(&mut self, viewport_width: usize) {
+        if let Ok(text) = self.clipboard.get_text() {
+            // Delete selection first if exists
+            self.delete_selection();
+            
+            let before = self.caret;
+            let char_pos = self.rope.byte_to_char(self.caret);
+            let bytes_inserted = text.len();
+            self.rope.insert(char_pos, &text);
+            self.caret += bytes_inserted;
+            
+            self.push_op(EditOp::Insert { pos: before, text: text.clone() }, before, self.caret);
+            
             self.invalidate_visual_lines();
             
             let (_, col) = self.get_visual_position(self.caret, viewport_width);
@@ -797,6 +846,22 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                 match key.code {
                     KeyCode::Char('q') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                         return Ok(());
+                    }
+                    KeyCode::Char('a') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                        editor.select_all();
+                        editor.update_viewport(viewport_height, viewport_width);
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                        editor.copy();
+                    }
+                    KeyCode::Char('x') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                        if editor.cut() {
+                            editor.update_viewport(viewport_height, viewport_width);
+                        }
+                    }
+                    KeyCode::Char('v') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                        editor.paste(viewport_width);
+                        editor.update_viewport(viewport_height, viewport_width);
                     }
                     KeyCode::Char('w') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                         editor.word_wrap = !editor.word_wrap;
