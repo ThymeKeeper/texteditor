@@ -64,6 +64,7 @@ struct Prompt {
     active_field: FindReplaceField,
     find_scroll_offset: usize,
     replace_scroll_offset: usize,
+    save_as_scroll_offset: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -128,6 +129,7 @@ impl Prompt {
             active_field: FindReplaceField::Find,
             find_scroll_offset: 0,
             replace_scroll_offset: 0,
+            save_as_scroll_offset: 0,
         }
     }
 
@@ -145,6 +147,7 @@ impl Prompt {
             active_field: FindReplaceField::Find,
             find_scroll_offset: 0,
             replace_scroll_offset: 0,
+            save_as_scroll_offset: 0,
         }
     }
 
@@ -162,6 +165,7 @@ impl Prompt {
             active_field: FindReplaceField::Find,
             find_scroll_offset: 0,
             replace_scroll_offset: 0,
+            save_as_scroll_offset: 0,
         }
     }
 
@@ -706,12 +710,13 @@ impl Prompt {
     fn handle_click(&mut self, click_x: u16, area: Rect, shift_held: bool) {
         if matches!(self.prompt_type, PromptType::SaveAs) {
             let relative_x = click_x.saturating_sub(area.x) as usize;
+            let target_pos = relative_x + self.save_as_scroll_offset;
             
             // Find the character position based on visual width
             let mut visual_pos = 0;
             let mut byte_pos = 0;
             for (idx, ch) in self.input.char_indices() {
-                if visual_pos >= relative_x {
+                if visual_pos >= target_pos {
                     byte_pos = idx;
                     break;
                 }
@@ -719,7 +724,7 @@ impl Prompt {
                 byte_pos = idx + ch.len_utf8();
             }
             
-            if visual_pos < relative_x {
+            if visual_pos < target_pos {
                 byte_pos = self.input.len();
             }
             
@@ -739,12 +744,13 @@ impl Prompt {
     fn handle_drag(&mut self, drag_x: u16, area: Rect) {
         if matches!(self.prompt_type, PromptType::SaveAs) {
             let relative_x = drag_x.saturating_sub(area.x) as usize;
+            let target_pos = relative_x + self.save_as_scroll_offset;
             
             // Find the character position based on visual width
             let mut visual_pos = 0;
             let mut byte_pos = 0;
             for (idx, ch) in self.input.char_indices() {
-                if visual_pos >= relative_x {
+                if visual_pos >= target_pos {
                     byte_pos = idx;
                     break;
                 }
@@ -752,7 +758,7 @@ impl Prompt {
                 byte_pos = idx + ch.len_utf8();
             }
             
-            if visual_pos < relative_x {
+            if visual_pos < target_pos {
                 byte_pos = self.input.len();
             }
             
@@ -762,6 +768,23 @@ impl Prompt {
 
     fn update_scroll_offset(&mut self, field_width: usize) {
         match self.prompt_type {
+            PromptType::SaveAs => {
+                // Calculate visual cursor position
+                let mut visual_pos = 0;
+                for (idx, ch) in self.input.char_indices() {
+                    if idx >= self.cursor_pos {
+                        break;
+                    }
+                    visual_pos += ch.to_string().width();
+                }
+                
+                // Adjust scroll offset to keep cursor visible
+                if visual_pos < self.save_as_scroll_offset {
+                    self.save_as_scroll_offset = visual_pos;
+                } else if visual_pos >= self.save_as_scroll_offset + field_width {
+                    self.save_as_scroll_offset = visual_pos.saturating_sub(field_width - 1);
+                }
+            }
             PromptType::FindReplace => {
                 match self.active_field {
                     FindReplaceField::Find => {
@@ -2818,19 +2841,35 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                 let message = Paragraph::new(prompt.message.as_str());
                 f.render_widget(message, input_area[0]);
                 
-                // Render input with selection highlighting
+                // Update scroll offset for the input field
+                let field_width = input_area[1].width as usize;
+                prompt.update_scroll_offset(field_width);
+                
+                // Render input with selection highlighting and horizontal scrolling
                 let mut spans = vec![];
-                if let Some((sel_start, sel_end)) = prompt.get_selection_range() {
-                    for (idx, ch) in prompt.input.char_indices() {
+                let mut visual_pos = 0;
+                let mut display_width = 0;
+                
+                // Build the visible text with proper scrolling
+                for (idx, ch) in prompt.input.char_indices() {
+                    let ch_width = ch.to_string().width();
+                    
+                    if visual_pos >= prompt.save_as_scroll_offset && display_width < field_width {
                         let ch_str = ch.to_string();
-                        if idx >= sel_start && idx < sel_end {
-                            spans.push(Span::styled(ch_str, Style::default().bg(Color::Blue).fg(Color::White)));
+                        let style = if let Some((sel_start, sel_end)) = prompt.get_selection_range() {
+                            if idx >= sel_start && idx < sel_end {
+                                Style::default().bg(Color::Blue).fg(Color::White)
+                            } else {
+                                Style::default()
+                            }
                         } else {
-                            spans.push(Span::raw(ch_str));
-                        }
+                            Style::default()
+                        };
+                        spans.push(Span::styled(ch_str, style));
+                        display_width += ch_width;
                     }
-                } else {
-                    spans.push(Span::raw(&prompt.input));
+                    
+                    visual_pos += ch_width;
                 }
                 
                 let input = Paragraph::new(Line::from(spans))
@@ -2845,7 +2884,8 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                     }
                     visual_cursor_pos += ch.to_string().width();
                 }
-                let cursor_x = inner.x + visual_cursor_pos.min(inner.width as usize - 1) as u16;
+                let screen_pos = visual_cursor_pos.saturating_sub(prompt.save_as_scroll_offset);
+                let cursor_x = input_area[1].x + screen_pos.min(input_area[1].width as usize - 1) as u16;
                 f.set_cursor(cursor_x, input_area[1].y);
             }
             PromptType::ConfirmSave => {
