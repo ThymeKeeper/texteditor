@@ -1,5 +1,6 @@
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEventKind},
+    cursor::SetCursorStyle,
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEventKind, MouseButton},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
@@ -45,6 +46,7 @@ struct UndoGroup {
 struct Editor {
     rope: Rope,
     caret: usize,
+    selection_anchor: Option<usize>, // New field for selection
     preferred_col: usize,
     viewport_offset: (usize, usize), // (row, col)
     word_wrap: bool,
@@ -59,6 +61,7 @@ struct Editor {
     redo_stack: Vec<UndoGroup>,
     current_group: Option<UndoGroup>,
     last_edit_time: Option<Instant>,
+    is_dragging: bool, // Track if mouse is being dragged
 }
 
 impl Editor {
@@ -66,6 +69,7 @@ impl Editor {
         let mut editor = Self {
             rope: Rope::new(),
             caret: 0,
+            selection_anchor: None,
             preferred_col: 0,
             viewport_offset: (0, 0),
             word_wrap: true,
@@ -80,6 +84,7 @@ impl Editor {
             redo_stack: Vec::new(),
             current_group: None,
             last_edit_time: None,
+            is_dragging: false,
         };
         editor.invalidate_visual_lines();
         editor
@@ -90,6 +95,7 @@ impl Editor {
         self.rope = Rope::from_str(&content);
         self.filename = Some(path);
         self.caret = 0;
+        self.selection_anchor = None;
         self.preferred_col = 0;
         self.modified = false;
         self.invalidate_visual_lines();
@@ -97,6 +103,45 @@ impl Editor {
         self.undo_stack.clear();
         self.redo_stack.clear();
         Ok(())
+    }
+
+    fn has_selection(&self) -> bool {
+        self.selection_anchor.is_some()
+    }
+
+    fn get_selection_range(&self) -> Option<(usize, usize)> {
+        self.selection_anchor.map(|anchor| {
+            if anchor <= self.caret {
+                (anchor, self.caret)
+            } else {
+                (self.caret, anchor)
+            }
+        })
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        if let Some((start, end)) = self.get_selection_range() {
+            if start < end {
+                let text = self.rope.byte_slice(start..end).to_string();
+                let before = self.caret;
+                
+                let start_char = self.rope.byte_to_char(start);
+                let end_char = self.rope.byte_to_char(end);
+                self.rope.remove(start_char..end_char);
+                
+                self.caret = start;
+                self.push_op(EditOp::Delete { pos: start, text }, before, self.caret);
+                
+                self.invalidate_visual_lines();
+                self.clear_selection();
+                return true;
+            }
+        }
+        false
     }
 
     fn push_op(&mut self, op: EditOp, caret_before: usize, caret_after: usize) {
@@ -149,6 +194,7 @@ impl Editor {
             }
             
             self.caret = caret;
+            self.clear_selection();
             self.invalidate_visual_lines();
             self.logical_line_map.clear(); // Force rebuild of the map
             self.redo_stack.push(group);
@@ -174,6 +220,7 @@ impl Editor {
             }
             
             self.caret = caret;
+            self.clear_selection();
             self.invalidate_visual_lines();
             self.logical_line_map.clear(); // Force rebuild of the map
             self.undo_stack.push(group);
@@ -404,7 +451,13 @@ impl Editor {
         }
     }
 
-    fn move_up(&mut self, viewport_width: usize) {
+    fn move_up(&mut self, viewport_width: usize, extend_selection: bool) {
+        if extend_selection && self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.caret);
+        } else if !extend_selection {
+            self.clear_selection();
+        }
+
         let (row, _) = self.get_visual_position(self.caret, viewport_width);
         if row > self.virtual_lines {
             self.caret = self.visual_to_byte(row - 1, self.preferred_col, viewport_width);
@@ -414,7 +467,13 @@ impl Editor {
         }
     }
 
-    fn move_down(&mut self, viewport_width: usize) {
+    fn move_down(&mut self, viewport_width: usize, extend_selection: bool) {
+        if extend_selection && self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.caret);
+        } else if !extend_selection {
+            self.clear_selection();
+        }
+
         let (row, _) = self.get_visual_position(self.caret, viewport_width);
         let total_visual_lines = self.visual_lines.len();
         let last_content_row = total_visual_lines - self.virtual_lines - 1;
@@ -430,7 +489,24 @@ impl Editor {
         }
     }
 
-    fn move_left(&mut self, viewport_width: usize) {
+    fn move_left(&mut self, viewport_width: usize, extend_selection: bool) {
+        if !extend_selection && self.has_selection() {
+            // Clear selection and move to start of selection
+            if let Some((start, _)) = self.get_selection_range() {
+                self.caret = start;
+                self.clear_selection();
+                let (_, col) = self.get_visual_position(self.caret, viewport_width);
+                self.preferred_col = col;
+                return;
+            }
+        }
+
+        if extend_selection && self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.caret);
+        } else if !extend_selection {
+            self.clear_selection();
+        }
+
         if self.caret > 0 {
             let char_idx = self.rope.byte_to_char(self.caret);
             if char_idx > 0 {
@@ -441,7 +517,24 @@ impl Editor {
         }
     }
 
-    fn move_right(&mut self, viewport_width: usize) {
+    fn move_right(&mut self, viewport_width: usize, extend_selection: bool) {
+        if !extend_selection && self.has_selection() {
+            // Clear selection and move to end of selection
+            if let Some((_, end)) = self.get_selection_range() {
+                self.caret = end;
+                self.clear_selection();
+                let (_, col) = self.get_visual_position(self.caret, viewport_width);
+                self.preferred_col = col;
+                return;
+            }
+        }
+
+        if extend_selection && self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.caret);
+        } else if !extend_selection {
+            self.clear_selection();
+        }
+
         if self.caret < self.rope.len_bytes() {
             let char_idx = self.rope.byte_to_char(self.caret);
             if char_idx < self.rope.len_chars() {
@@ -453,6 +546,9 @@ impl Editor {
     }
 
     fn insert_char(&mut self, ch: char, viewport_width: usize) {
+        // Delete selection first if exists
+        self.delete_selection();
+
         let before = self.caret;
         self.rope.insert_char(self.rope.byte_to_char(self.caret), ch);
         self.caret += ch.len_utf8();
@@ -467,6 +563,11 @@ impl Editor {
     }
 
     fn delete(&mut self, viewport_width: usize) {
+        // If there's a selection, delete it
+        if self.delete_selection() {
+            return;
+        }
+
         if self.caret < self.rope.len_bytes() {
             let char_idx = self.rope.byte_to_char(self.caret);
             
@@ -483,6 +584,11 @@ impl Editor {
     }
 
     fn backspace(&mut self, viewport_width: usize) {
+        // If there's a selection, delete it
+        if self.delete_selection() {
+            return;
+        }
+
         if self.caret > 0 {
             let char_idx = self.rope.byte_to_char(self.caret);
             if char_idx > 0 {
@@ -582,7 +688,7 @@ impl Editor {
         }
     }
 
-    fn handle_click(&mut self, col: u16, row: u16, area: Rect, viewport_width: usize) {
+    fn handle_click(&mut self, col: u16, row: u16, area: Rect, viewport_width: usize, shift_held: bool) {
         self.ensure_visual_lines(viewport_width);
         let click_row = self.viewport_offset.0 + row.saturating_sub(area.y) as usize;
         let click_col = self.viewport_offset.1 + col.saturating_sub(area.x) as usize;
@@ -597,7 +703,20 @@ impl Editor {
                 } else {
                     click_col
                 };
-                self.caret = self.visual_to_byte(click_row, actual_col, viewport_width);
+                let new_pos = self.visual_to_byte(click_row, actual_col, viewport_width);
+                
+                if shift_held {
+                    // Shift+click: extend selection
+                    if self.selection_anchor.is_none() {
+                        self.selection_anchor = Some(self.caret);
+                    }
+                    self.caret = new_pos;
+                } else {
+                    // Regular click: clear selection and move caret
+                    self.clear_selection();
+                    self.caret = new_pos;
+                }
+                
                 self.preferred_col = actual_col;
             }
         }
@@ -639,7 +758,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        SetCursorStyle::DefaultUserShape
     )?;
     terminal.show_cursor()?;
     
@@ -716,19 +836,19 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                         editor.update_viewport(viewport_height, viewport_width);
                     }
                     KeyCode::Left => {
-                        editor.move_left(viewport_width);
+                        editor.move_left(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
                         editor.update_viewport(viewport_height, viewport_width);
                     }
                     KeyCode::Right => {
-                        editor.move_right(viewport_width);
+                        editor.move_right(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
                         editor.update_viewport(viewport_height, viewport_width);
                     }
                     KeyCode::Up => {
-                        editor.move_up(viewport_width);
+                        editor.move_up(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
                         editor.update_viewport(viewport_height, viewport_width);
                     }
                     KeyCode::Down => {
-                        editor.move_down(viewport_width);
+                        editor.move_down(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
                         editor.update_viewport(viewport_height, viewport_width);
                     }
                     _ => {}
@@ -739,7 +859,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
             Event::Mouse(mouse) => {
                 let size = terminal.size()?;
                 match mouse.kind {
-                    MouseEventKind::Down(_) => {
+                    MouseEventKind::Down(MouseButton::Left) => {
                         let chunks = Layout::default()
                             .direction(Direction::Vertical)
                             .constraints([
@@ -747,7 +867,46 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                 Constraint::Length(1),
                             ])
                             .split(size);
-                        editor.handle_click(mouse.column, mouse.row, chunks[0], size.width as usize);
+                        
+                        let shift_held = mouse.modifiers.contains(event::KeyModifiers::SHIFT);
+                        editor.handle_click(mouse.column, mouse.row, chunks[0], size.width as usize, shift_held);
+                        
+                        // Start dragging
+                        editor.is_dragging = true;
+                        if !shift_held {
+                            editor.selection_anchor = Some(editor.caret);
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if editor.is_dragging {
+                            let chunks = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([
+                                    Constraint::Min(0),
+                                    Constraint::Length(1),
+                                ])
+                                .split(size);
+                            
+                            // Update caret position but keep selection anchor
+                            let click_row = editor.viewport_offset.0 + mouse.row.saturating_sub(chunks[0].y) as usize;
+                            let click_col = editor.viewport_offset.1 + mouse.column.saturating_sub(chunks[0].x) as usize;
+                            
+                            if click_row >= editor.virtual_lines && 
+                               click_row < editor.visual_lines.len() - editor.virtual_lines {
+                                if let Some(Some(vline)) = editor.visual_lines.get(click_row) {
+                                    let actual_col = if vline.is_continuation {
+                                        click_col.max(vline.indent)
+                                    } else {
+                                        click_col
+                                    };
+                                    editor.caret = editor.visual_to_byte(click_row, actual_col, size.width as usize);
+                                    editor.preferred_col = actual_col;
+                                }
+                            }
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        editor.is_dragging = false;
                     }
                     MouseEventKind::ScrollUp => {
                         editor.viewport_offset.0 = editor.viewport_offset.0.saturating_sub(3);
@@ -786,6 +945,9 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     editor.ensure_visual_lines(viewport_width);
     editor.update_viewport(viewport_height, viewport_width);
     
+    // Get selection range
+    let selection_range = editor.get_selection_range();
+    
     // Render main text area
     let mut lines = Vec::new();
     let (caret_row, caret_col) = editor.get_visual_position(editor.caret, viewport_width);
@@ -818,7 +980,34 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                 if vline.indent > 0 {
                     spans.push(Span::raw(" ".repeat(vline.indent)));
                 }
-                spans.push(Span::raw(display_text));
+                
+                // Handle selection highlighting
+                if let Some((sel_start, sel_end)) = selection_range {
+                    let line_start = vline.start_byte;
+                    let line_end = vline.end_byte;
+                    
+                    if sel_end > line_start && sel_start < line_end {
+                        // This line contains part of the selection
+                        let mut byte_pos = 0;
+                        for ch in display_text.chars() {
+                            let ch_str = ch.to_string();
+                            let ch_bytes = ch.len_utf8();
+                            let global_pos = line_start + byte_pos;
+                            
+                            if global_pos >= sel_start && global_pos < sel_end {
+                                spans.push(Span::styled(ch_str, Style::default().bg(Color::Blue).fg(Color::White)));
+                            } else {
+                                spans.push(Span::raw(ch_str));
+                            }
+                            
+                            byte_pos += ch_bytes;
+                        }
+                    } else {
+                        spans.push(Span::raw(display_text));
+                    }
+                } else {
+                    spans.push(Span::raw(display_text));
+                }
                 
                 lines.push(Line::from(spans));
             } else {
@@ -853,14 +1042,33 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
         }
     }
     
+    // Set cursor style based on selection state
+    let cursor_style = if editor.has_selection() {
+        SetCursorStyle::SteadyUnderScore
+    } else {
+        SetCursorStyle::SteadyBlock
+    };
+    execute!(io::stdout(), cursor_style).unwrap();
+    
     // Render status bar
     let (line, col) = editor.get_position();
+    let selection_info = if editor.has_selection() {
+        if let Some((start, end)) = selection_range {
+            format!(" | {} chars selected", end - start)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    
     let status_text = format!(
-        " {} | {} | {}:{} ",
+        " {} | {} | {}:{}{} ",
         editor.get_display_name(),
         if editor.word_wrap { "Wrap" } else { "No-Wrap" },
         line,
-        col
+        col,
+        selection_info
     );
     
     let status = Paragraph::new(Line::from(vec![Span::raw(status_text)]))
