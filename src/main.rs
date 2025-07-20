@@ -1089,7 +1089,7 @@ impl Editor {
         let trimmed = line.trim_start();
         let base_indent = line.len() - trimmed.len();
         
-        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ")  || trimmed.starts_with("▢ ")  || trimmed.starts_with("◪ ")  || trimmed.starts_with("■ ") {
             return base_indent + 4;
         }
         
