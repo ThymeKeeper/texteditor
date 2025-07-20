@@ -1399,58 +1399,167 @@ impl Editor {
     }
 
     fn indent(&mut self, viewport_width: usize) {
-        let char_idx = self.rope.byte_to_char(self.caret);
-        let line_idx = self.rope.char_to_line(char_idx);
-        let line_start = self.rope.line_to_char(line_idx);
-        let line_byte = self.rope.char_to_byte(line_start);
-        
-        let before = self.caret;
-        self.rope.insert(line_start, "    ");
-        if self.caret >= line_byte {
-            self.caret += 4;
-        }
-        
-        self.push_op(EditOp::Insert { pos: line_byte, text: "    ".to_string() }, before, self.caret);
-        
-        self.invalidate_visual_lines();
-        
-        let (_, col) = self.get_visual_position(self.caret, viewport_width);
-        self.preferred_col = col;
-    }
-
-    fn dedent(&mut self, viewport_width: usize) {
-        let char_idx = self.rope.byte_to_char(self.caret);
-        let line_idx = self.rope.char_to_line(char_idx);
-        let line = self.rope.line(line_idx);
-        
-        let mut spaces = 0;
-        for ch in line.chars().take(4) {
-            if ch == ' ' {
-                spaces += 1;
-            } else {
-                break;
+        if let Some((start, end)) = self.get_selection_range() {
+            // Handle selection - indent all lines in selection
+            let start_char = self.rope.byte_to_char(start);
+            let end_char = self.rope.byte_to_char(end);
+            let start_line = self.rope.char_to_line(start_char);
+            let end_line = self.rope.char_to_line(end_char);
+            
+            let before_caret = self.caret;
+            let mut caret_adjustment = 0;
+            let mut anchor_adjustment = 0;
+            
+            // Process lines from end to start to avoid offset issues
+            for line_idx in (start_line..=end_line).rev() {
+                let line_start = self.rope.line_to_char(line_idx);
+                let line_byte = self.rope.char_to_byte(line_start);
+                
+                self.rope.insert(line_start, "    ");
+                
+                // Track adjustments for caret and anchor
+                if self.caret >= line_byte {
+                    caret_adjustment += 4;
+                }
+                
+                if let Some(anchor) = self.selection_anchor {
+                    if anchor >= line_byte {
+                        anchor_adjustment += 4;
+                    }
+                }
+                
+                self.push_op(EditOp::Insert { pos: line_byte, text: "    ".to_string() }, before_caret, self.caret);
             }
-        }
-        
-        if spaces > 0 {
+            
+            // Apply adjustments
+            self.caret += caret_adjustment;
+            if let Some(anchor) = self.selection_anchor {
+                self.selection_anchor = Some(anchor + anchor_adjustment);
+            }
+            
+            self.invalidate_visual_lines();
+            let (_, col) = self.get_visual_position(self.caret, viewport_width);
+            self.preferred_col = col;
+        } else {
+            // No selection - indent current line only
+            let char_idx = self.rope.byte_to_char(self.caret);
+            let line_idx = self.rope.char_to_line(char_idx);
             let line_start = self.rope.line_to_char(line_idx);
             let line_byte = self.rope.char_to_byte(line_start);
+            
             let before = self.caret;
-            
-            self.rope.remove(line_start..line_start + spaces);
-            
-            if self.caret >= line_byte + spaces {
-                self.caret -= spaces;
-            } else if self.caret > line_byte {
-                self.caret = line_byte;
+            self.rope.insert(line_start, "    ");
+            if self.caret >= line_byte {
+                self.caret += 4;
             }
             
-            self.push_op(EditOp::Delete { pos: line_byte, text: " ".repeat(spaces) }, before, self.caret);
+            self.push_op(EditOp::Insert { pos: line_byte, text: "    ".to_string() }, before, self.caret);
             
             self.invalidate_visual_lines();
             
             let (_, col) = self.get_visual_position(self.caret, viewport_width);
             self.preferred_col = col;
+        }
+    }
+
+    fn dedent(&mut self, viewport_width: usize) {
+        if let Some((start, end)) = self.get_selection_range() {
+            // Handle selection - dedent all lines in selection
+            let start_char = self.rope.byte_to_char(start);
+            let end_char = self.rope.byte_to_char(end);
+            let start_line = self.rope.char_to_line(start_char);
+            let end_line = self.rope.char_to_line(end_char);
+            
+            let before_caret = self.caret;
+            let mut caret_adjustment = 0;
+            let mut anchor_adjustment = 0;
+            
+            // Process lines from end to start to avoid offset issues
+            for line_idx in (start_line..=end_line).rev() {
+                let line = self.rope.line(line_idx);
+                
+                let mut spaces = 0;
+                for ch in line.chars().take(4) {
+                    if ch == ' ' {
+                        spaces += 1;
+                    } else {
+                        break;
+                    }
+                }
+                
+                if spaces > 0 {
+                    let line_start = self.rope.line_to_char(line_idx);
+                    let line_byte = self.rope.char_to_byte(line_start);
+                    
+                    self.rope.remove(line_start..line_start + spaces);
+                    
+                    // Track adjustments for caret and anchor
+                    if self.caret > line_byte {
+                        if self.caret >= line_byte + spaces {
+                            caret_adjustment += spaces;
+                        } else {
+                            caret_adjustment += self.caret - line_byte;
+                        }
+                    }
+                    
+                    if let Some(anchor) = self.selection_anchor {
+                        if anchor > line_byte {
+                            if anchor >= line_byte + spaces {
+                                anchor_adjustment += spaces;
+                            } else {
+                                anchor_adjustment += anchor - line_byte;
+                            }
+                        }
+                    }
+                    
+                    self.push_op(EditOp::Delete { pos: line_byte, text: " ".repeat(spaces) }, before_caret, self.caret);
+                }
+            }
+            
+            // Apply adjustments
+            self.caret -= caret_adjustment;
+            if let Some(anchor) = self.selection_anchor {
+                self.selection_anchor = Some(anchor - anchor_adjustment);
+            }
+            
+            self.invalidate_visual_lines();
+            let (_, col) = self.get_visual_position(self.caret, viewport_width);
+            self.preferred_col = col;
+        } else {
+            // No selection - dedent current line only
+            let char_idx = self.rope.byte_to_char(self.caret);
+            let line_idx = self.rope.char_to_line(char_idx);
+            let line = self.rope.line(line_idx);
+            
+            let mut spaces = 0;
+            for ch in line.chars().take(4) {
+                if ch == ' ' {
+                    spaces += 1;
+                } else {
+                    break;
+                }
+            }
+            
+            if spaces > 0 {
+                let line_start = self.rope.line_to_char(line_idx);
+                let line_byte = self.rope.char_to_byte(line_start);
+                let before = self.caret;
+                
+                self.rope.remove(line_start..line_start + spaces);
+                
+                if self.caret >= line_byte + spaces {
+                    self.caret -= spaces;
+                } else if self.caret > line_byte {
+                    self.caret = line_byte;
+                }
+                
+                self.push_op(EditOp::Delete { pos: line_byte, text: " ".repeat(spaces) }, before, self.caret);
+                
+                self.invalidate_visual_lines();
+                
+                let (_, col) = self.get_visual_position(self.caret, viewport_width);
+                self.preferred_col = col;
+            }
         }
     }
 
@@ -2044,6 +2153,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                 } else {
                                     editor.indent(viewport_width);
                                 }
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::BackTab => {
+                                editor.dedent(viewport_width);
+                                editor.update_viewport(viewport_height, viewport_width);
                             }
                             KeyCode::Char(c) => {
                                 editor.insert_char(c, viewport_width);
