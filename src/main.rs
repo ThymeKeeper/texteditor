@@ -48,6 +48,7 @@ struct UndoGroup {
 enum PromptType {
     SaveAs,
     ConfirmSave,
+    FindReplace,
 }
 
 struct Prompt {
@@ -57,9 +58,61 @@ struct Prompt {
     cursor_pos: usize,
     selection_anchor: Option<usize>,
     clipboard: Clipboard,
+    replace_input: String,
+    replace_cursor_pos: usize,
+    replace_selection_anchor: Option<usize>,
+    active_field: FindReplaceField,
+    find_scroll_offset: usize,
+    replace_scroll_offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FindReplaceField {
+    Find,
+    Replace,
+    Buffer,
 }
 
 impl Prompt {
+    fn get_active_input(&self) -> &str {
+        match self.prompt_type {
+            PromptType::FindReplace => {
+                match self.active_field {
+                    FindReplaceField::Find => &self.input,
+                    FindReplaceField::Replace => &self.replace_input,
+                    FindReplaceField::Buffer => &self.input,  // Return find input when buffer focused
+                }
+            }
+            _ => &self.input,
+        }
+    }
+
+    fn get_active_cursor_pos(&self) -> usize {
+        match self.prompt_type {
+            PromptType::FindReplace => {
+                match self.active_field {
+                    FindReplaceField::Find => self.cursor_pos,
+                    FindReplaceField::Replace => self.replace_cursor_pos,
+                    FindReplaceField::Buffer => 0,  // Cursor not relevant when buffer focused
+                }
+            }
+            _ => self.cursor_pos,
+        }
+    }
+
+    fn set_active_cursor_pos(&mut self, pos: usize) {
+        match self.prompt_type {
+            PromptType::FindReplace => {
+                match self.active_field {
+                    FindReplaceField::Find => self.cursor_pos = pos,
+                    FindReplaceField::Replace => self.replace_cursor_pos = pos,
+                    FindReplaceField::Buffer => {} // No-op when buffer focused
+                }
+            }
+            _ => self.cursor_pos = pos,
+        }
+    }
+
     fn new_save_as(default_path: String) -> Self {
         let cursor_pos = default_path.len();
         Self {
@@ -69,6 +122,12 @@ impl Prompt {
             cursor_pos,
             selection_anchor: None,
             clipboard: Clipboard::new().unwrap(),
+            replace_input: String::new(),
+            replace_cursor_pos: 0,
+            replace_selection_anchor: None,
+            active_field: FindReplaceField::Find,
+            find_scroll_offset: 0,
+            replace_scroll_offset: 0,
         }
     }
 
@@ -80,32 +139,117 @@ impl Prompt {
             cursor_pos: 0,
             selection_anchor: None,
             clipboard: Clipboard::new().unwrap(),
+            replace_input: String::new(),
+            replace_cursor_pos: 0,
+            replace_selection_anchor: None,
+            active_field: FindReplaceField::Find,
+            find_scroll_offset: 0,
+            replace_scroll_offset: 0,
+        }
+    }
+
+    fn new_find_replace() -> Self {
+        Self {
+            prompt_type: PromptType::FindReplace,
+            message: String::new(),
+            input: String::new(),
+            cursor_pos: 0,
+            selection_anchor: None,
+            clipboard: Clipboard::new().unwrap(),
+            replace_input: String::new(),
+            replace_cursor_pos: 0,
+            replace_selection_anchor: None,
+            active_field: FindReplaceField::Find,
+            find_scroll_offset: 0,
+            replace_scroll_offset: 0,
         }
     }
 
     fn has_selection(&self) -> bool {
-        self.selection_anchor.is_some()
+        match self.prompt_type {
+            PromptType::FindReplace => {
+                match self.active_field {
+                    FindReplaceField::Find => self.selection_anchor.is_some(),
+                    FindReplaceField::Replace => self.replace_selection_anchor.is_some(),
+                    FindReplaceField::Buffer => false,  // No selection when buffer focused
+                }
+            }
+            _ => self.selection_anchor.is_some(),
+        }
     }
 
     fn get_selection_range(&self) -> Option<(usize, usize)> {
-        self.selection_anchor.map(|anchor| {
-            if anchor <= self.cursor_pos {
-                (anchor, self.cursor_pos)
-            } else {
-                (self.cursor_pos, anchor)
+        match self.prompt_type {
+            PromptType::FindReplace => {
+                match self.active_field {
+                    FindReplaceField::Find => {
+                        self.selection_anchor.map(|anchor| {
+                            if anchor <= self.cursor_pos {
+                                (anchor, self.cursor_pos)
+                            } else {
+                                (self.cursor_pos, anchor)
+                            }
+                        })
+                    }
+                    FindReplaceField::Replace => {
+                        self.replace_selection_anchor.map(|anchor| {
+                            if anchor <= self.replace_cursor_pos {
+                                (anchor, self.replace_cursor_pos)
+                            } else {
+                                (self.replace_cursor_pos, anchor)
+                            }
+                        })
+                    }
+                    FindReplaceField::Buffer => None,  // No selection when buffer focused
+                }
             }
-        })
+            _ => {
+                self.selection_anchor.map(|anchor| {
+                    if anchor <= self.cursor_pos {
+                        (anchor, self.cursor_pos)
+                    } else {
+                        (self.cursor_pos, anchor)
+                    }
+                })
+            }
+        }
     }
 
     fn clear_selection(&mut self) {
-        self.selection_anchor = None;
+        match self.prompt_type {
+            PromptType::FindReplace => {
+                match self.active_field {
+                    FindReplaceField::Find => self.selection_anchor = None,
+                    FindReplaceField::Replace => self.replace_selection_anchor = None,
+                    FindReplaceField::Buffer => {} // No-op when buffer focused
+                }
+            }
+            _ => self.selection_anchor = None,
+        }
     }
 
     fn delete_selection(&mut self) -> bool {
         if let Some((start, end)) = self.get_selection_range() {
             if start < end {
-                self.input.drain(start..end);
-                self.cursor_pos = start;
+                match self.prompt_type {
+                    PromptType::FindReplace => {
+                        match self.active_field {
+                            FindReplaceField::Find => {
+                                self.input.drain(start..end);
+                                self.cursor_pos = start;
+                            }
+                            FindReplaceField::Replace => {
+                                self.replace_input.drain(start..end);
+                                self.replace_cursor_pos = start;
+                            }
+                            FindReplaceField::Buffer => {} // No-op when buffer focused
+                        }
+                    }
+                    _ => {
+                        self.input.drain(start..end);
+                        self.cursor_pos = start;
+                    }
+                }
                 self.clear_selection();
                 return true;
             }
@@ -114,16 +258,41 @@ impl Prompt {
     }
 
     fn select_all(&mut self) {
-        if matches!(self.prompt_type, PromptType::SaveAs) {
-            self.selection_anchor = Some(0);
-            self.cursor_pos = self.input.len();
+        match self.prompt_type {
+            PromptType::SaveAs => {
+                self.selection_anchor = Some(0);
+                self.cursor_pos = self.input.len();
+            }
+            PromptType::FindReplace => {
+                match self.active_field {
+                    FindReplaceField::Find => {
+                        self.selection_anchor = Some(0);
+                        self.cursor_pos = self.input.len();
+                    }
+                    FindReplaceField::Replace => {
+                        self.replace_selection_anchor = Some(0);
+                        self.replace_cursor_pos = self.replace_input.len();
+                    }
+                    FindReplaceField::Buffer => {} // No-op when buffer focused
+                }
+            }
+            _ => {}
         }
     }
 
     fn copy(&mut self) -> bool {
         if let Some((start, end)) = self.get_selection_range() {
             if start < end {
-                let text = self.input[start..end].to_string();
+                let text = match self.prompt_type {
+                    PromptType::FindReplace => {
+                        match self.active_field {
+                            FindReplaceField::Find => self.input[start..end].to_string(),
+                            FindReplaceField::Replace => self.replace_input[start..end].to_string(),
+                            FindReplaceField::Buffer => String::new(), // No text when buffer focused
+                        }
+                    }
+                    _ => self.input[start..end].to_string(),
+                };
                 if let Err(_) = self.clipboard.set_text(text) {
                     return false;
                 }
@@ -142,130 +311,396 @@ impl Prompt {
     }
 
     fn paste(&mut self) {
-        if matches!(self.prompt_type, PromptType::SaveAs) {
-            if let Ok(text) = self.clipboard.get_text() {
-                self.delete_selection();
-                self.input.insert_str(self.cursor_pos, &text);
-                self.cursor_pos += text.len();
+        match self.prompt_type {
+            PromptType::SaveAs => {
+                if let Ok(text) = self.clipboard.get_text() {
+                    self.delete_selection();
+                    self.input.insert_str(self.cursor_pos, &text);
+                    self.cursor_pos += text.len();
+                }
             }
+            PromptType::FindReplace => {
+                if let Ok(text) = self.clipboard.get_text() {
+                    self.delete_selection();
+                    match self.active_field {
+                        FindReplaceField::Find => {
+                            self.input.insert_str(self.cursor_pos, &text);
+                            self.cursor_pos += text.len();
+                        }
+                        FindReplaceField::Replace => {
+                            self.replace_input.insert_str(self.replace_cursor_pos, &text);
+                            self.replace_cursor_pos += text.len();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
     fn insert_char(&mut self, ch: char) {
-        if matches!(self.prompt_type, PromptType::SaveAs) {
-            self.delete_selection();
-            self.input.insert(self.cursor_pos, ch);
-            self.cursor_pos += ch.len_utf8();
+        match self.prompt_type {
+            PromptType::SaveAs => {
+                self.delete_selection();
+                self.input.insert(self.cursor_pos, ch);
+                self.cursor_pos += ch.len_utf8();
+            }
+            PromptType::FindReplace => {
+                self.delete_selection();
+                match self.active_field {
+                    FindReplaceField::Find => {
+                        self.input.insert(self.cursor_pos, ch);
+                        self.cursor_pos += ch.len_utf8();
+                    }
+                    FindReplaceField::Replace => {
+                        self.replace_input.insert(self.replace_cursor_pos, ch);
+                        self.replace_cursor_pos += ch.len_utf8();
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
 
     fn backspace(&mut self) {
-        if matches!(self.prompt_type, PromptType::SaveAs) {
-            if self.delete_selection() {
-                return;
-            }
-            
-            if self.cursor_pos > 0 {
-                let char_boundary = self.input
-                    .char_indices()
-                    .rev()
-                    .find(|(idx, _)| *idx < self.cursor_pos)
-                    .map(|(idx, ch)| (idx, ch.len_utf8()));
+        match self.prompt_type {
+            PromptType::SaveAs => {
+                if self.delete_selection() {
+                    return;
+                }
                 
-                if let Some((idx, _len)) = char_boundary {
-                    self.input.remove(idx);
-                    self.cursor_pos = idx;
+                if self.cursor_pos > 0 {
+                    let char_boundary = self.input
+                        .char_indices()
+                        .rev()
+                        .find(|(idx, _)| *idx < self.cursor_pos)
+                        .map(|(idx, ch)| (idx, ch.len_utf8()));
+                    
+                    if let Some((idx, _len)) = char_boundary {
+                        self.input.remove(idx);
+                        self.cursor_pos = idx;
+                    }
                 }
             }
+            PromptType::FindReplace => {
+                if self.delete_selection() {
+                    return;
+                }
+                
+                match self.active_field {
+                    FindReplaceField::Find => {
+                        if self.cursor_pos > 0 {
+                            let char_boundary = self.input
+                                .char_indices()
+                                .rev()
+                                .find(|(idx, _)| *idx < self.cursor_pos)
+                                .map(|(idx, ch)| (idx, ch.len_utf8()));
+                            
+                            if let Some((idx, _len)) = char_boundary {
+                                self.input.remove(idx);
+                                self.cursor_pos = idx;
+                            }
+                        }
+                    }
+                    FindReplaceField::Replace => {
+                        if self.replace_cursor_pos > 0 {
+                            let char_boundary = self.replace_input
+                                .char_indices()
+                                .rev()
+                                .find(|(idx, _)| *idx < self.replace_cursor_pos)
+                                .map(|(idx, ch)| (idx, ch.len_utf8()));
+                            
+                            if let Some((idx, _len)) = char_boundary {
+                                self.replace_input.remove(idx);
+                                self.replace_cursor_pos = idx;
+                            }
+                        }
+                    }
+                    FindReplaceField::Buffer => {} // No-op when buffer focused
+                }
+            }
+            _ => {}
         }
     }
 
     fn delete(&mut self) {
-        if matches!(self.prompt_type, PromptType::SaveAs) {
-            if self.delete_selection() {
-                return;
-            }
-            
-            if self.cursor_pos < self.input.len() {
-                let char_boundary = self.input
-                    .char_indices()
-                    .find(|(idx, _)| *idx >= self.cursor_pos)
-                    .map(|(idx, ch)| (idx, ch.len_utf8()));
+        match self.prompt_type {
+            PromptType::SaveAs => {
+                if self.delete_selection() {
+                    return;
+                }
                 
-                if let Some((idx, len)) = char_boundary {
-                    self.input.drain(idx..idx + len);
+                if self.cursor_pos < self.input.len() {
+                    let char_boundary = self.input
+                        .char_indices()
+                        .find(|(idx, _)| *idx >= self.cursor_pos)
+                        .map(|(idx, ch)| (idx, ch.len_utf8()));
+                    
+                    if let Some((idx, len)) = char_boundary {
+                        self.input.drain(idx..idx + len);
+                    }
+                }
+            }
+            PromptType::FindReplace => {
+                if self.delete_selection() {
+                    return;
+                }
+                
+                match self.active_field {
+                    FindReplaceField::Find => {
+                        if self.cursor_pos < self.input.len() {
+                            let char_boundary = self.input
+                                .char_indices()
+                                .find(|(idx, _)| *idx >= self.cursor_pos)
+                                .map(|(idx, ch)| (idx, ch.len_utf8()));
+                            
+                            if let Some((idx, len)) = char_boundary {
+                                self.input.drain(idx..idx + len);
+                            }
+                        }
+                    }
+                    FindReplaceField::Replace => {
+                        if self.replace_cursor_pos < self.replace_input.len() {
+                            let char_boundary = self.replace_input
+                                .char_indices()
+                                .find(|(idx, _)| *idx >= self.replace_cursor_pos)
+                                .map(|(idx, ch)| (idx, ch.len_utf8()));
+                            
+                            if let Some((idx, len)) = char_boundary {
+                                self.replace_input.drain(idx..idx + len);
+                            }
+                        }
+                    }
+                    FindReplaceField::Buffer => {} // No-op when buffer focused
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_cursor_left(&mut self, extend_selection: bool) {
+        match self.prompt_type {
+            PromptType::FindReplace => {
+                match self.active_field {
+                    FindReplaceField::Find => {
+                        if !extend_selection && self.has_selection() {
+                            if let Some((start, _)) = self.get_selection_range() {
+                                self.cursor_pos = start;
+                                self.clear_selection();
+                                return;
+                            }
+                        }
+                        if extend_selection && self.selection_anchor.is_none() {
+                            self.selection_anchor = Some(self.cursor_pos);
+                        } else if !extend_selection {
+                            self.clear_selection();
+                        }
+                        if self.cursor_pos > 0 {
+                            let new_pos = self.input
+                                .char_indices()
+                                .rev()
+                                .find(|(idx, _)| *idx < self.cursor_pos)
+                                .map(|(idx, _)| idx)
+                                .unwrap_or(0);
+                            self.cursor_pos = new_pos;
+                        }
+                    }
+                    FindReplaceField::Replace => {
+                        if !extend_selection && self.has_selection() {
+                            if let Some((start, _)) = self.get_selection_range() {
+                                self.replace_cursor_pos = start;
+                                self.clear_selection();
+                                return;
+                            }
+                        }
+                        if extend_selection && self.replace_selection_anchor.is_none() {
+                            self.replace_selection_anchor = Some(self.replace_cursor_pos);
+                        } else if !extend_selection {
+                            self.clear_selection();
+                        }
+                        if self.replace_cursor_pos > 0 {
+                            let new_pos = self.replace_input
+                                .char_indices()
+                                .rev()
+                                .find(|(idx, _)| *idx < self.replace_cursor_pos)
+                                .map(|(idx, _)| idx)
+                                .unwrap_or(0);
+                            self.replace_cursor_pos = new_pos;
+                        }
+                    }
+                    FindReplaceField::Buffer => {} // No-op when buffer focused
+                }
+            }
+            _ => {
+                if !extend_selection && self.has_selection() {
+                    if let Some((start, _)) = self.get_selection_range() {
+                        self.cursor_pos = start;
+                        self.clear_selection();
+                        return;
+                    }
+                }
+                if extend_selection && self.selection_anchor.is_none() {
+                    self.selection_anchor = Some(self.cursor_pos);
+                } else if !extend_selection {
+                    self.clear_selection();
+                }
+                if self.cursor_pos > 0 {
+                    let new_pos = self.input
+                        .char_indices()
+                        .rev()
+                        .find(|(idx, _)| *idx < self.cursor_pos)
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(0);
+                    self.cursor_pos = new_pos;
                 }
             }
         }
     }
 
-    fn move_cursor_left(&mut self, extend_selection: bool) {
-        if !extend_selection && self.has_selection() {
-            if let Some((start, _)) = self.get_selection_range() {
-                self.cursor_pos = start;
-                self.clear_selection();
-                return;
-            }
-        }
-
-        if extend_selection && self.selection_anchor.is_none() {
-            self.selection_anchor = Some(self.cursor_pos);
-        } else if !extend_selection {
-            self.clear_selection();
-        }
-
-        if self.cursor_pos > 0 {
-            let new_pos = self.input
-                .char_indices()
-                .rev()
-                .find(|(idx, _)| *idx < self.cursor_pos)
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
-            self.cursor_pos = new_pos;
-        }
-    }
-
     fn move_cursor_right(&mut self, extend_selection: bool) {
-        if !extend_selection && self.has_selection() {
-            if let Some((_, end)) = self.get_selection_range() {
-                self.cursor_pos = end;
-                self.clear_selection();
-                return;
+        match self.prompt_type {
+            PromptType::FindReplace => {
+                match self.active_field {
+                    FindReplaceField::Find => {
+                        if !extend_selection && self.has_selection() {
+                            if let Some((_, end)) = self.get_selection_range() {
+                                self.cursor_pos = end;
+                                self.clear_selection();
+                                return;
+                            }
+                        }
+                        if extend_selection && self.selection_anchor.is_none() {
+                            self.selection_anchor = Some(self.cursor_pos);
+                        } else if !extend_selection {
+                            self.clear_selection();
+                        }
+                        if self.cursor_pos < self.input.len() {
+                            let new_pos = self.input
+                                .char_indices()
+                                .find(|(idx, _)| *idx > self.cursor_pos)
+                                .map(|(idx, _)| idx)
+                                .unwrap_or(self.input.len());
+                            self.cursor_pos = new_pos;
+                        }
+                    }
+                    FindReplaceField::Replace => {
+                        if !extend_selection && self.has_selection() {
+                            if let Some((_, end)) = self.get_selection_range() {
+                                self.replace_cursor_pos = end;
+                                self.clear_selection();
+                                return;
+                            }
+                        }
+                        if extend_selection && self.replace_selection_anchor.is_none() {
+                            self.replace_selection_anchor = Some(self.replace_cursor_pos);
+                        } else if !extend_selection {
+                            self.clear_selection();
+                        }
+                        if self.replace_cursor_pos < self.replace_input.len() {
+                            let new_pos = self.replace_input
+                                .char_indices()
+                                .find(|(idx, _)| *idx > self.replace_cursor_pos)
+                                .map(|(idx, _)| idx)
+                                .unwrap_or(self.replace_input.len());
+                            self.replace_cursor_pos = new_pos;
+                        }
+                    }
+                    FindReplaceField::Buffer => {} // No-op when buffer focused
+                }
             }
-        }
-
-        if extend_selection && self.selection_anchor.is_none() {
-            self.selection_anchor = Some(self.cursor_pos);
-        } else if !extend_selection {
-            self.clear_selection();
-        }
-
-        if self.cursor_pos < self.input.len() {
-            let new_pos = self.input
-                .char_indices()
-                .find(|(idx, _)| *idx > self.cursor_pos)
-                .map(|(idx, _)| idx)
-                .unwrap_or(self.input.len());
-            self.cursor_pos = new_pos;
+            _ => {
+                if !extend_selection && self.has_selection() {
+                    if let Some((_, end)) = self.get_selection_range() {
+                        self.cursor_pos = end;
+                        self.clear_selection();
+                        return;
+                    }
+                }
+                if extend_selection && self.selection_anchor.is_none() {
+                    self.selection_anchor = Some(self.cursor_pos);
+                } else if !extend_selection {
+                    self.clear_selection();
+                }
+                if self.cursor_pos < self.input.len() {
+                    let new_pos = self.input
+                        .char_indices()
+                        .find(|(idx, _)| *idx > self.cursor_pos)
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(self.input.len());
+                    self.cursor_pos = new_pos;
+                }
+            }
         }
     }
 
     fn move_cursor_home(&mut self, extend_selection: bool) {
-        if extend_selection && self.selection_anchor.is_none() {
-            self.selection_anchor = Some(self.cursor_pos);
-        } else if !extend_selection {
-            self.clear_selection();
+        match self.prompt_type {
+            PromptType::FindReplace => {
+                match self.active_field {
+                    FindReplaceField::Find => {
+                        if extend_selection && self.selection_anchor.is_none() {
+                            self.selection_anchor = Some(self.cursor_pos);
+                        } else if !extend_selection {
+                            self.clear_selection();
+                        }
+                        self.cursor_pos = 0;
+                    }
+                    FindReplaceField::Replace => {
+                        if extend_selection && self.replace_selection_anchor.is_none() {
+                            self.replace_selection_anchor = Some(self.replace_cursor_pos);
+                        } else if !extend_selection {
+                            self.clear_selection();
+                        }
+                        self.replace_cursor_pos = 0;
+                    }
+                    FindReplaceField::Buffer => {} // No-op when buffer focused
+                }
+            }
+            _ => {
+                if extend_selection && self.selection_anchor.is_none() {
+                    self.selection_anchor = Some(self.cursor_pos);
+                } else if !extend_selection {
+                    self.clear_selection();
+                }
+                self.cursor_pos = 0;
+            }
         }
-        self.cursor_pos = 0;
     }
 
     fn move_cursor_end(&mut self, extend_selection: bool) {
-        if extend_selection && self.selection_anchor.is_none() {
-            self.selection_anchor = Some(self.cursor_pos);
-        } else if !extend_selection {
-            self.clear_selection();
+        match self.prompt_type {
+            PromptType::FindReplace => {
+                match self.active_field {
+                    FindReplaceField::Find => {
+                        if extend_selection && self.selection_anchor.is_none() {
+                            self.selection_anchor = Some(self.cursor_pos);
+                        } else if !extend_selection {
+                            self.clear_selection();
+                        }
+                        self.cursor_pos = self.input.len();
+                    }
+                    FindReplaceField::Replace => {
+                        if extend_selection && self.replace_selection_anchor.is_none() {
+                            self.replace_selection_anchor = Some(self.replace_cursor_pos);
+                        } else if !extend_selection {
+                            self.clear_selection();
+                        }
+                        self.replace_cursor_pos = self.replace_input.len();
+                    }
+                    FindReplaceField::Buffer => {} // No-op when buffer focused
+                }
+            }
+            _ => {
+                if extend_selection && self.selection_anchor.is_none() {
+                    self.selection_anchor = Some(self.cursor_pos);
+                } else if !extend_selection {
+                    self.clear_selection();
+                }
+                self.cursor_pos = self.input.len();
+            }
         }
-        self.cursor_pos = self.input.len();
     }
 
     fn handle_click(&mut self, click_x: u16, area: Rect, shift_held: bool) {
@@ -324,6 +759,51 @@ impl Prompt {
             self.cursor_pos = byte_pos;
         }
     }
+
+    fn update_scroll_offset(&mut self, field_width: usize) {
+        match self.prompt_type {
+            PromptType::FindReplace => {
+                match self.active_field {
+                    FindReplaceField::Find => {
+                        // Calculate visual cursor position
+                        let mut visual_pos = 0;
+                        for (idx, ch) in self.input.char_indices() {
+                            if idx >= self.cursor_pos {
+                                break;
+                            }
+                            visual_pos += ch.to_string().width();
+                        }
+                        
+                        // Adjust scroll offset to keep cursor visible
+                        if visual_pos < self.find_scroll_offset {
+                            self.find_scroll_offset = visual_pos;
+                        } else if visual_pos >= self.find_scroll_offset + field_width {
+                            self.find_scroll_offset = visual_pos.saturating_sub(field_width - 1);
+                        }
+                    }
+                    FindReplaceField::Replace => {
+                        // Calculate visual cursor position
+                        let mut visual_pos = 0;
+                        for (idx, ch) in self.replace_input.char_indices() {
+                            if idx >= self.replace_cursor_pos {
+                                break;
+                            }
+                            visual_pos += ch.to_string().width();
+                        }
+                        
+                        // Adjust scroll offset to keep cursor visible
+                        if visual_pos < self.replace_scroll_offset {
+                            self.replace_scroll_offset = visual_pos;
+                        } else if visual_pos >= self.replace_scroll_offset + field_width {
+                            self.replace_scroll_offset = visual_pos.saturating_sub(field_width - 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 enum AppState {
@@ -354,6 +834,8 @@ struct Editor {
     clipboard: Clipboard,
     current_dir: PathBuf,
     app_state: AppState,
+    find_matches: Vec<(usize, usize)>,
+    current_match_index: Option<usize>,
 }
 
 impl Editor {
@@ -381,6 +863,8 @@ impl Editor {
             clipboard: Clipboard::new().unwrap(),
             current_dir,
             app_state: AppState::Editing,
+            find_matches: Vec::new(),
+            current_match_index: None,
         };
         editor.invalidate_visual_lines();
         editor
@@ -1086,6 +1570,167 @@ impl Editor {
         let col = char_idx - line_start;
         (line + 1, col + 1)
     }
+
+    fn update_find_matches(&mut self, query: &str) {
+        self.find_matches.clear();
+        self.current_match_index = None;
+
+        if query.is_empty() {
+            return;
+        }
+
+        let text = self.rope.to_string();
+        let query_bytes = query.as_bytes();
+        
+        for (idx, window) in text.as_bytes().windows(query_bytes.len()).enumerate() {
+            if window == query_bytes {
+                self.find_matches.push((idx, idx + query_bytes.len()));
+            }
+        }
+
+        if !self.find_matches.is_empty() {
+            // Find the first match at or after the current caret position
+            let current_pos = self.caret;
+            let mut found_index = None;
+            
+            for (i, &(match_start, _)) in self.find_matches.iter().enumerate() {
+                if match_start >= current_pos {
+                    found_index = Some(i);
+                    break;
+                }
+            }
+            
+            // If no match after current position, wrap to the first match
+            self.current_match_index = found_index.or(Some(0));
+            
+            // Only jump to match if buffer is not focused
+            if let AppState::Prompting(ref prompt) = self.app_state {
+                if !(matches!(prompt.prompt_type, PromptType::FindReplace) && prompt.active_field == FindReplaceField::Buffer) {
+                    self.jump_to_current_match();
+                }
+            }
+        }
+    }
+
+    fn find_next(&mut self) {
+        if let Some(idx) = self.current_match_index {
+            if !self.find_matches.is_empty() {
+                self.current_match_index = Some((idx + 1) % self.find_matches.len());
+                self.jump_to_current_match();
+            }
+        }
+    }
+
+    fn find_previous(&mut self) {
+        if let Some(idx) = self.current_match_index {
+            if !self.find_matches.is_empty() {
+                self.current_match_index = Some(if idx == 0 {
+                    self.find_matches.len() - 1
+                } else {
+                    idx - 1
+                });
+                self.jump_to_current_match();
+            }
+        }
+    }
+
+    fn jump_to_current_match(&mut self) {
+        if let Some(idx) = self.current_match_index {
+            if let Some(&(start, _)) = self.find_matches.get(idx) {
+                self.caret = start;
+                self.selection_anchor = None;
+                self.preferred_col = 0;
+            }
+        }
+    }
+
+    fn replace_current(&mut self, replacement: &str, viewport_width: usize) {
+        if let Some(idx) = self.current_match_index {
+            if let Some(&(start, end)) = self.find_matches.get(idx) {
+                self.caret = start;
+                self.selection_anchor = Some(end);
+                
+                self.delete_selection();
+                for ch in replacement.chars() {
+                    self.insert_char(ch, viewport_width);
+                }
+                
+                let query = if let AppState::Prompting(ref prompt) = self.app_state {
+                    prompt.input.clone()
+                } else {
+                    String::new()
+                };
+                
+                if !query.is_empty() {
+                    // Remember the position after replacement
+                    let position_after_replace = self.caret;
+                    
+                    self.update_find_matches(&query);
+                    
+                    // After updating matches, find the next match AFTER the replacement
+                    if !self.find_matches.is_empty() {
+                        let mut found_next = false;
+                        
+                        // Look for a match that starts after our current position
+                        for (i, &(match_start, _)) in self.find_matches.iter().enumerate() {
+                            if match_start > position_after_replace {
+                                self.current_match_index = Some(i);
+                                found_next = true;
+                                break;
+                            }
+                        }
+                        
+                        // If no match after current position, wrap to the first match
+                        if !found_next {
+                            self.current_match_index = Some(0);
+                        }
+                        
+                        self.jump_to_current_match();
+                    } else {
+                        self.current_match_index = None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn replace_all(&mut self, query: &str, replacement: &str, viewport_width: usize) {
+        if query.is_empty() {
+            return;
+        }
+
+        self.update_find_matches(query);
+        
+        while !self.find_matches.is_empty() {
+            if let Some(&(start, end)) = self.find_matches.get(0) {
+                self.caret = start;
+                self.selection_anchor = Some(end);
+                
+                self.delete_selection();
+                for ch in replacement.chars() {
+                    self.insert_char(ch, viewport_width);
+                }
+                
+                self.update_find_matches(query);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn refresh_find_matches_if_active(&mut self) {
+        if let AppState::Prompting(ref prompt) = self.app_state {
+            if matches!(prompt.prompt_type, PromptType::FindReplace) && !prompt.input.is_empty() {
+                let query = prompt.input.clone();
+                self.update_find_matches(&query);
+            }
+        }
+    }
+
+    fn clear_find_matches(&mut self) {
+        self.find_matches.clear();
+        self.current_match_index = None;
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -1143,10 +1788,54 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                 
                 match &mut editor.app_state {
                     AppState::Prompting(prompt) => {
-                        match key.code {
-                            KeyCode::Esc => {
-                                editor.app_state = AppState::Editing;
+                        // Handle buffer-focused input for find/replace mode
+                        if matches!(prompt.prompt_type, PromptType::FindReplace) && prompt.active_field == FindReplaceField::Buffer {
+                            // Allow normal editor commands except Tab and Esc
+                            match key.code {
+                                KeyCode::Esc => {
+                                    editor.clear_find_matches();
+                                    editor.app_state = AppState::Editing;
+                                }
+                                KeyCode::Tab => {
+                                    // Switch focus back to find field
+                                    prompt.active_field = FindReplaceField::Find;
+                                }
+                                KeyCode::Char('f') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                    if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                        editor.find_previous();
+                                    } else {
+                                        editor.find_next();
+                                    }
+                                    editor.update_viewport(viewport_height, viewport_width);
+                                }
+                                KeyCode::Char('h') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                    if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                        let query = prompt.input.clone();
+                                        let replacement = prompt.replace_input.clone();
+                                        editor.replace_all(&query, &replacement, viewport_width);
+                                        editor.update_viewport(viewport_height, viewport_width);
+                                        editor.clear_find_matches();
+                                        editor.app_state = AppState::Editing;
+                                    } else {
+                                        let replacement = prompt.replace_input.clone();
+                                        editor.replace_current(&replacement, viewport_width);
+                                        editor.update_viewport(viewport_height, viewport_width);
+                                    }
+                                }
+                                _ => {
+                                    // Handle normal editor commands
+                                    handle_editor_key(&mut editor, key, viewport_width, viewport_height)?;
+                                }
                             }
+                        } else {
+                            // Normal prompt handling
+                            match key.code {
+                                KeyCode::Esc => {
+                                    if matches!(prompt.prompt_type, PromptType::FindReplace) {
+                                        editor.clear_find_matches();
+                                    }
+                                    editor.app_state = AppState::Editing;
+                                }
                             KeyCode::Enter => {
                                 match prompt.prompt_type {
                                     PromptType::SaveAs => {
@@ -1158,11 +1847,17 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                             } else {
                                                 execute!(io::stdout(), SetTitle(&editor.get_display_name()))?;
                                             }
+                                            editor.clear_find_matches();
                                             editor.app_state = AppState::Editing;
                                         }
                                     }
                                     PromptType::ConfirmSave => {
                                         // Handle in the key event below
+                                    }
+                                    PromptType::FindReplace => {
+                                        // Handle Enter for find operation
+                                        let query = prompt.input.clone();
+                                        editor.update_find_matches(&query);
                                     }
                                 }
                             }
@@ -1177,6 +1872,40 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                             }
                             KeyCode::Char('v') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                                 prompt.paste();
+                            }
+                            KeyCode::Tab if matches!(prompt.prompt_type, PromptType::FindReplace) => {
+                                // Switch between find, replace, and buffer
+                                match prompt.active_field {
+                                    FindReplaceField::Find => prompt.active_field = FindReplaceField::Replace,
+                                    FindReplaceField::Replace => prompt.active_field = FindReplaceField::Buffer,
+                                    FindReplaceField::Buffer => prompt.active_field = FindReplaceField::Find,
+                                }
+                            }
+                            KeyCode::Char('f') if key.modifiers.contains(event::KeyModifiers::CONTROL) && matches!(prompt.prompt_type, PromptType::FindReplace) => {
+                                if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                    // Find previous
+                                    editor.find_previous();
+                                } else {
+                                    // Find next
+                                    editor.find_next();
+                                }
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Char('h') if key.modifiers.contains(event::KeyModifiers::CONTROL) && matches!(prompt.prompt_type, PromptType::FindReplace) => {
+                                if key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                    // Replace all
+                                    let query = prompt.input.clone();
+                                    let replacement = prompt.replace_input.clone();
+                                    editor.replace_all(&query, &replacement, viewport_width);
+                                    editor.update_viewport(viewport_height, viewport_width);
+                                    editor.clear_find_matches();
+                                    editor.app_state = AppState::Editing;
+                                } else {
+                                    // Replace current and find next
+                                    let replacement = prompt.replace_input.clone();
+                                    editor.replace_current(&replacement, viewport_width);
+                                    editor.update_viewport(viewport_height, viewport_width);
+                                }
                             }
                             KeyCode::Char(ch) => {
                                 match prompt.prompt_type {
@@ -1197,6 +1926,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                                 editor.app_state = AppState::Exiting;
                                             }
                                             'c' => {
+                                                if matches!(prompt.prompt_type, PromptType::FindReplace) {
+                                                    editor.clear_find_matches();
+                                                }
                                                 editor.app_state = AppState::Editing;
                                             }
                                             _ => {}
@@ -1204,14 +1936,26 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                     }
                                     _ => {
                                         prompt.insert_char(ch);
+                                        if matches!(prompt.prompt_type, PromptType::FindReplace) && prompt.active_field == FindReplaceField::Find {
+                                            let query = prompt.input.clone();
+                                            editor.update_find_matches(&query);
+                                        }
                                     }
                                 }
                             }
                             KeyCode::Backspace => {
                                 prompt.backspace();
+                                if matches!(prompt.prompt_type, PromptType::FindReplace) && prompt.active_field == FindReplaceField::Find {
+                                    let query = prompt.input.clone();
+                                    editor.update_find_matches(&query);
+                                }
                             }
                             KeyCode::Delete => {
                                 prompt.delete();
+                                if matches!(prompt.prompt_type, PromptType::FindReplace) && prompt.active_field == FindReplaceField::Find {
+                                    let query = prompt.input.clone();
+                                    editor.update_find_matches(&query);
+                                }
                             }
                             KeyCode::Left => {
                                 prompt.move_cursor_left(key.modifiers.contains(event::KeyModifiers::SHIFT));
@@ -1226,6 +1970,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                 prompt.move_cursor_end(key.modifiers.contains(event::KeyModifiers::SHIFT));
                             }
                             _ => {}
+                        }
                         }
                     }
                     AppState::Editing => {
@@ -1289,6 +2034,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                             KeyCode::Char('y') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                                 editor.redo();
                                 editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::Char('f') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                editor.app_state = AppState::Prompting(Prompt::new_find_replace());
                             }
                             KeyCode::Tab => {
                                 if key.modifiers.contains(event::KeyModifiers::SHIFT) {
@@ -1451,6 +2199,79 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     }
 }
 
+fn handle_editor_key(editor: &mut Editor, key: event::KeyEvent, viewport_width: usize, viewport_height: usize) -> io::Result<()> {
+    match key.code {
+        KeyCode::Char('a') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            editor.select_all();
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            editor.copy();
+        }
+        KeyCode::Char('x') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            if editor.cut() {
+                editor.refresh_find_matches_if_active();
+                editor.update_viewport(viewport_height, viewport_width);
+            }
+        }
+        KeyCode::Char('v') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            editor.paste(viewport_width);
+            editor.refresh_find_matches_if_active();
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::Char('z') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            editor.undo();
+            editor.refresh_find_matches_if_active();
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::Char('y') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            editor.redo();
+            editor.refresh_find_matches_if_active();
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::Char(c) => {
+            editor.insert_char(c, viewport_width);
+            editor.refresh_find_matches_if_active();
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::Enter => {
+            editor.insert_char('\n', viewport_width);
+            editor.preferred_col = 0;
+            editor.refresh_find_matches_if_active();
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::Backspace => {
+            editor.backspace(viewport_width);
+            editor.refresh_find_matches_if_active();
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::Delete => {
+            editor.delete(viewport_width);
+            editor.refresh_find_matches_if_active();
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::Left => {
+            editor.move_left(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::Right => {
+            editor.move_right(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::Up => {
+            editor.move_up(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::Down => {
+            editor.move_down(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        _ => {}
+    }
+    execute!(io::stdout(), SetTitle(&editor.get_display_name()))?;
+    Ok(())
+}
+
 fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1479,19 +2300,30 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
             if let Some(vline) = vline_opt {
                 let text = editor.rope.byte_slice(vline.start_byte..vline.end_byte).to_string();
                 
-                let display_text = if editor.word_wrap || editor.viewport_offset.1 == 0 {
-                    text
+                let (display_text, display_start_offset) = if editor.word_wrap || editor.viewport_offset.1 == 0 {
+                    (text, 0)
                 } else {
                     let mut result = String::new();
                     let mut width = 0;
+                    let mut byte_offset = 0;
+                    let mut display_start_offset = 0;
+                    let mut found_start = false;
                     
                     for ch in text.chars() {
-                        width += ch.to_string().width();
+                        let ch_width = ch.to_string().width();
+                        width += ch_width;
+                        
                         if width > editor.viewport_offset.1 {
+                            if !found_start {
+                                display_start_offset = byte_offset;
+                                found_start = true;
+                            }
                             result.push(ch);
                         }
+                        
+                        byte_offset += ch.len_utf8();
                     }
-                    result
+                    (result, display_start_offset)
                 };
                 
                 let mut spans = vec![];
@@ -1499,30 +2331,53 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                     spans.push(Span::raw(" ".repeat(vline.indent)));
                 }
                 
+                // Check for find matches in this line
+                let mut char_styles = vec![Style::default(); display_text.len()];
+                
+                // Apply selection highlighting
                 if let Some((sel_start, sel_end)) = selection_range {
                     let line_start = vline.start_byte;
                     let line_end = vline.end_byte;
                     
                     if sel_end > line_start && sel_start < line_end {
-                        let mut byte_pos = 0;
-                        for ch in display_text.chars() {
-                            let ch_str = ch.to_string();
-                            let ch_bytes = ch.len_utf8();
+                        let mut byte_pos = display_start_offset;
+                        for (i, ch) in display_text.chars().enumerate() {
                             let global_pos = line_start + byte_pos;
-                            
                             if global_pos >= sel_start && global_pos < sel_end {
-                                spans.push(Span::styled(ch_str, Style::default().bg(Color::Blue).fg(Color::White)));
-                            } else {
-                                spans.push(Span::raw(ch_str));
+                                char_styles[i] = Style::default().bg(Color::Blue).fg(Color::White);
                             }
-                            
-                            byte_pos += ch_bytes;
+                            byte_pos += ch.len_utf8();
                         }
-                    } else {
-                        spans.push(Span::raw(display_text));
                     }
-                } else {
-                    spans.push(Span::raw(display_text));
+                }
+                
+                // Apply find match highlighting
+                let line_start = vline.start_byte;
+                for &(match_start, match_end) in &editor.find_matches {
+                    if match_end > line_start && match_start < vline.end_byte {
+                        let mut byte_pos = display_start_offset;
+                        for (i, ch) in display_text.chars().enumerate() {
+                            let global_pos = line_start + byte_pos;
+                            if global_pos >= match_start && global_pos < match_end {
+                                // Current match gets a different color
+                                if let Some(current_idx) = editor.current_match_index {
+                                    if editor.find_matches.get(current_idx) == Some(&(match_start, match_end)) {
+                                        char_styles[i] = Style::default().bg(Color::Yellow).fg(Color::Black);
+                                    } else {
+                                        char_styles[i] = Style::default().bg(Color::Green).fg(Color::Black);
+                                    }
+                                } else {
+                                    char_styles[i] = Style::default().bg(Color::Green).fg(Color::Black);
+                                }
+                            }
+                            byte_pos += ch.len_utf8();
+                        }
+                    }
+                }
+                
+                // Build spans with styles
+                for (i, ch) in display_text.chars().enumerate() {
+                    spans.push(Span::styled(ch.to_string(), char_styles[i]));
                 }
                 
                 lines.push(Line::from(spans));
@@ -1536,27 +2391,24 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
         lines.push(Line::default());
     }
     
-    let paragraph = Paragraph::new(lines);
+    let paragraph = Paragraph::new(lines.clone());
     f.render_widget(paragraph, chunks[0]);
     
     // Draw prompt if active
-    if let AppState::Prompting(prompt) = &editor.app_state {
-        let area = centered_rect(60, 20, f.size());
-        f.render_widget(Clear, area);
-        
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(match prompt.prompt_type {
-                PromptType::SaveAs => "Save As",
-                PromptType::ConfirmSave => "Unsaved Changes",
-            })
-            .style(Style::default().bg(Color::Black));
-        
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        
+    if let AppState::Prompting(prompt) = &mut editor.app_state {
         match prompt.prompt_type {
             PromptType::SaveAs => {
+                let area = centered_rect(60, 20, f.size());
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title("Save As")
+                    .style(Style::default().bg(Color::Black));
+                
+                let inner = block.inner(area);
+                f.render_widget(block, area);
+                
                 let input_area = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -1600,8 +2452,234 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                 f.set_cursor(cursor_x, input_area[1].y);
             }
             PromptType::ConfirmSave => {
+                let area = centered_rect(60, 20, f.size());
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title("Unsaved Changes")
+                    .style(Style::default().bg(Color::Black));
+                
+                let inner = block.inner(area);
+                f.render_widget(block, area);
+                
                 let message = Paragraph::new(prompt.message.as_str());
                 f.render_widget(message, inner);
+            }
+            PromptType::FindReplace => {
+                // Render find/replace as a bar at the bottom above the status bar
+                let find_replace_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(0),
+                        Constraint::Length(3),
+                        Constraint::Length(1),
+                    ])
+                    .split(f.size());
+                
+                let find_replace_area = find_replace_chunks[1];
+                f.render_widget(Clear, find_replace_area);
+                
+                let block_style = if prompt.active_field == FindReplaceField::Buffer {
+                    Style::default().bg(Color::Black).fg(Color::DarkGray)
+                } else {
+                    Style::default().bg(Color::Black)
+                };
+                
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .style(block_style)
+                    .title(" Find/Replace (Tab to switch focus) ");
+                
+                let inner = block.inner(find_replace_area);
+                f.render_widget(block, find_replace_area);
+                
+                // Split into find and replace fields
+                let fields = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Length(10),
+                        Constraint::Min(20),
+                        Constraint::Length(10),
+                        Constraint::Min(20),
+                    ])
+                    .split(inner);
+                
+                // Find label and field
+                let find_label = Paragraph::new("Find: ");
+                f.render_widget(find_label, fields[0]);
+                
+                // Update scroll offset for the find field
+                let field_width = fields[1].width as usize;
+                prompt.update_scroll_offset(field_width);
+                
+                // Find input field
+                let mut find_spans = vec![];
+                let mut visual_pos = 0;
+                let mut display_width = 0;
+                
+                // Build the visible text with proper scrolling
+                for (idx, ch) in prompt.input.char_indices() {
+                    let ch_width = ch.to_string().width();
+                    
+                    if visual_pos >= prompt.find_scroll_offset && display_width < field_width {
+                        let ch_str = ch.to_string();
+                        let style = if prompt.active_field == FindReplaceField::Find {
+                            if let Some((sel_start, sel_end)) = prompt.get_selection_range() {
+                                if idx >= sel_start && idx < sel_end {
+                                    Style::default().bg(Color::Blue).fg(Color::White)
+                                } else {
+                                    Style::default()
+                                }
+                            } else {
+                                Style::default()
+                            }
+                        } else {
+                            Style::default()
+                        };
+                        find_spans.push(Span::styled(ch_str, style));
+                        display_width += ch_width;
+                    }
+                    visual_pos += ch_width;
+                }
+                
+                let find_style = if prompt.active_field == FindReplaceField::Find {
+                    Style::default().add_modifier(Modifier::UNDERLINED).fg(Color::Yellow)
+                } else {
+                    Style::default().add_modifier(Modifier::UNDERLINED)
+                };
+                
+                let find_input = Paragraph::new(Line::from(find_spans))
+                    .style(find_style);
+                f.render_widget(find_input, fields[1]);
+                
+                // Replace label and field
+                let replace_label = Paragraph::new("Replace: ");
+                f.render_widget(replace_label, fields[2]);
+                
+                // Replace input field
+                let mut replace_spans = vec![];
+                let mut visual_pos = 0;
+                let mut display_width = 0;
+                let replace_field_width = fields[3].width as usize;
+                
+                // Build the visible text with proper scrolling
+                for (idx, ch) in prompt.replace_input.char_indices() {
+                    let ch_width = ch.to_string().width();
+                    
+                    if visual_pos >= prompt.replace_scroll_offset && display_width < replace_field_width {
+                        let ch_str = ch.to_string();
+                        let style = if prompt.active_field == FindReplaceField::Replace {
+                            if let Some((sel_start, sel_end)) = prompt.get_selection_range() {
+                                if idx >= sel_start && idx < sel_end {
+                                    Style::default().bg(Color::Blue).fg(Color::White)
+                                } else {
+                                    Style::default()
+                                }
+                            } else {
+                                Style::default()
+                            }
+                        } else {
+                            Style::default()
+                        };
+                        replace_spans.push(Span::styled(ch_str, style));
+                        display_width += ch_width;
+                    }
+                    visual_pos += ch_width;
+                }
+                
+                let replace_style = if prompt.active_field == FindReplaceField::Replace {
+                    Style::default().add_modifier(Modifier::UNDERLINED).fg(Color::Yellow)
+                } else {
+                    Style::default().add_modifier(Modifier::UNDERLINED)
+                };
+                
+                let replace_input = Paragraph::new(Line::from(replace_spans))
+                    .style(replace_style);
+                f.render_widget(replace_input, fields[3]);
+                
+                // Set cursor position based on active field
+                if prompt.active_field != FindReplaceField::Buffer {
+                    let cursor_field = match prompt.active_field {
+                        FindReplaceField::Find => {
+                            let mut visual_cursor_pos = 0;
+                            for (idx, ch) in prompt.input.char_indices() {
+                                if idx >= prompt.cursor_pos {
+                                    break;
+                                }
+                                visual_cursor_pos += ch.to_string().width();
+                            }
+                            let screen_pos = visual_cursor_pos.saturating_sub(prompt.find_scroll_offset);
+                            (fields[1].x + screen_pos.min(fields[1].width as usize - 1) as u16, fields[1].y)
+                        }
+                        FindReplaceField::Replace => {
+                            let mut visual_cursor_pos = 0;
+                            for (idx, ch) in prompt.replace_input.char_indices() {
+                                if idx >= prompt.replace_cursor_pos {
+                                    break;
+                                }
+                                visual_cursor_pos += ch.to_string().width();
+                            }
+                            let screen_pos = visual_cursor_pos.saturating_sub(prompt.replace_scroll_offset);
+                            (fields[3].x + screen_pos.min(fields[3].width as usize - 1) as u16, fields[3].y)
+                        }
+                        _ => unreachable!(),
+                    };
+                    f.set_cursor(cursor_field.0, cursor_field.1);
+                } else {
+                    // When buffer has focus, set cursor in the editor area
+                    let (caret_row, caret_col) = editor.get_visual_position(editor.caret, viewport_width);
+                    if caret_row >= editor.viewport_offset.0 && caret_row < editor.viewport_offset.0 + viewport_height {
+                        let screen_row = caret_row - editor.viewport_offset.0;
+                        let screen_col = if editor.word_wrap {
+                            caret_col
+                        } else {
+                            caret_col.saturating_sub(editor.viewport_offset.1)
+                        };
+                        
+                        if screen_col < viewport_width {
+                            f.set_cursor(
+                                find_replace_chunks[0].x + screen_col as u16,
+                                find_replace_chunks[0].y + screen_row as u16,
+                            );
+                        }
+                    }
+                }
+                
+                // Still render the main editor area above the find/replace bar
+                let editor_paragraph = Paragraph::new(lines.clone());
+                f.render_widget(editor_paragraph, find_replace_chunks[0]);
+                
+                // Render status bar below find/replace
+                let (line, col) = editor.get_position();
+                let selection_info = if editor.has_selection() {
+                    if let Some((start, end)) = selection_range {
+                        format!(" | {} chars selected", end - start)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                
+                let status_text_fr = format!(
+                    " {} | {} | {}:{}{} | {} matches ",
+                    editor.get_display_name(),
+                    if editor.word_wrap { "Wrap" } else { "No-Wrap" },
+                    line,
+                    col,
+                    selection_info,
+                    editor.find_matches.len()
+                );
+                
+                let status_fr = Paragraph::new(Line::from(vec![Span::raw(status_text_fr)]))
+                    .style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                    .alignment(Alignment::Left);
+                
+                f.render_widget(status_fr, find_replace_chunks[2]);
+                
+                // Early return to avoid rendering the normal editor UI
+                return;
             }
         }
     } else {
