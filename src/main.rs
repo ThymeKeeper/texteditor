@@ -1628,6 +1628,186 @@ impl Editor {
         }
     }
 
+    fn move_lines_up(&mut self, viewport_width: usize) {
+        let (start_line, end_line) = if let Some((start, end)) = self.get_selection_range() {
+            let start_char = self.rope.byte_to_char(start);
+            let end_char = self.rope.byte_to_char(end);
+            let start_line = self.rope.char_to_line(start_char);
+            let end_line = self.rope.char_to_line(end_char);
+            (start_line, end_line)
+        } else {
+            let char_idx = self.rope.byte_to_char(self.caret);
+            let line_idx = self.rope.char_to_line(char_idx);
+            (line_idx, line_idx)
+        };
+        
+        if start_line == 0 {
+            return;
+        }
+        
+        let before_caret = self.caret;
+        let _before_anchor = self.selection_anchor;
+        
+        // Store original line count to detect if we're at the end
+        let total_lines = self.rope.len_lines();
+        let at_end_of_doc = end_line + 1 == total_lines;
+        
+        // Get complete lines including newlines
+        let prev_line_start = self.rope.line_to_char(start_line - 1);
+        let prev_line_end = self.rope.line_to_char(start_line);
+        
+        let block_start = self.rope.line_to_char(start_line);
+        let block_end = if end_line + 1 < total_lines {
+            self.rope.line_to_char(end_line + 1)
+        } else {
+            self.rope.len_chars()
+        };
+        
+        // Extract the complete lines
+        let prev_line_text = self.rope.slice(prev_line_start..prev_line_end).to_string();
+        let block_text = self.rope.slice(block_start..block_end).to_string();
+        
+        // Calculate byte positions
+        let prev_line_start_byte = self.rope.char_to_byte(prev_line_start);
+        let block_start_byte = self.rope.char_to_byte(block_start);
+        let block_end_byte = self.rope.char_to_byte(block_end);
+        
+        // Store the original content for undo
+        let original_content = self.rope.slice(prev_line_start..block_end).to_string();
+        
+        // Remove the entire section
+        self.rope.remove(prev_line_start..block_end);
+        
+        // Build new content: block first, then previous line
+        let new_content = if at_end_of_doc && !block_text.ends_with('\n') {
+            // Moving last line up - ensure it keeps proper ending
+            format!("{}\n{}", block_text.trim_end(), prev_line_text.trim_end())
+        } else {
+            // Normal case - just swap the content
+            format!("{}{}", block_text, prev_line_text)
+        };
+        
+        // Insert the reordered content
+        self.rope.insert(prev_line_start, &new_content);
+        
+        // Update caret and selection
+        
+        if self.caret >= block_start_byte && self.caret <= block_end_byte {
+            // The cursor was in the block that moved up
+            let offset_in_block = self.caret - block_start_byte;
+            self.caret = prev_line_start_byte + offset_in_block;
+        }
+        if let Some(anchor) = self.selection_anchor {
+            if anchor >= block_start_byte && anchor <= block_end_byte {
+                let offset_in_block = anchor - block_start_byte;
+                self.selection_anchor = Some(prev_line_start_byte + offset_in_block);
+            }
+        }
+        
+        // Record the operation for undo
+        self.push_op(EditOp::Delete { pos: prev_line_start_byte, text: original_content }, before_caret, self.caret);
+        self.push_op(EditOp::Insert { pos: prev_line_start_byte, text: new_content }, before_caret, self.caret);
+        
+        self.invalidate_visual_lines();
+        let (_, col) = self.get_visual_position(self.caret, viewport_width);
+        self.preferred_col = col;
+    }
+    
+    fn move_lines_down(&mut self, viewport_width: usize) {
+        let (start_line, end_line) = if let Some((start, end)) = self.get_selection_range() {
+            let start_char = self.rope.byte_to_char(start);
+            let end_char = self.rope.byte_to_char(end);
+            let start_line = self.rope.char_to_line(start_char);
+            let end_line = self.rope.char_to_line(end_char);
+            (start_line, end_line)
+        } else {
+            let char_idx = self.rope.byte_to_char(self.caret);
+            let line_idx = self.rope.char_to_line(char_idx);
+            (line_idx, line_idx)
+        };
+        
+        let total_lines = self.rope.len_lines();
+        
+        // Check if we're already at the last line
+        if end_line + 1 >= total_lines {
+            return;
+        }
+        
+        let before_caret = self.caret;
+        let _before_anchor = self.selection_anchor;
+        
+        let at_end_of_doc = end_line + 2 == total_lines;
+        
+        // Get complete lines including newlines
+        let block_start = self.rope.line_to_char(start_line);
+        let block_end = self.rope.line_to_char(end_line + 1);
+        
+        let next_line_start = self.rope.line_to_char(end_line + 1);
+        let next_line_end = if end_line + 2 < total_lines {
+            self.rope.line_to_char(end_line + 2)
+        } else {
+            self.rope.len_chars()
+        };
+        
+        // Extract the complete lines
+        let block_text = self.rope.slice(block_start..block_end).to_string();
+        let next_line_text = self.rope.slice(next_line_start..next_line_end).to_string();
+        
+        // Calculate byte positions
+        let block_start_byte = self.rope.char_to_byte(block_start);
+        let block_end_byte = self.rope.char_to_byte(block_end);
+        let _next_line_start_byte = self.rope.char_to_byte(next_line_start);
+        let _next_line_end_byte = self.rope.char_to_byte(next_line_end);
+        
+        // Store the original content for undo
+        let original_content = self.rope.slice(block_start..next_line_end).to_string();
+        
+        // Remove the entire section
+        self.rope.remove(block_start..next_line_end);
+        
+        // Build new content: next line first, then block
+        let new_content = if at_end_of_doc && !next_line_text.ends_with('\n') {
+            // Moving down where next line is the last line
+            format!("{}\n{}", next_line_text.trim_end(), block_text.trim_end())
+        } else {
+            // Normal case - just swap the content
+            format!("{}{}", next_line_text, block_text)
+        };
+        
+        // Insert the reordered content
+        self.rope.insert(block_start, &new_content);
+        
+        // Update caret and selection
+        // Calculate the actual size of the next line in the new content
+        let next_line_actual_size = if at_end_of_doc && !next_line_text.ends_with('\n') {
+            // We trimmed and added a newline
+            next_line_text.trim_end().as_bytes().len() + 1
+        } else {
+            next_line_text.as_bytes().len()
+        };
+        
+        if self.caret >= block_start_byte && self.caret < block_end_byte {
+            // The cursor was in the block that moved down
+            let offset_in_block = self.caret - block_start_byte;
+            self.caret = block_start_byte + next_line_actual_size + offset_in_block;
+        }
+        
+        if let Some(anchor) = self.selection_anchor {
+            if anchor >= block_start_byte && anchor < block_end_byte {
+                let offset_in_block = anchor - block_start_byte;
+                self.selection_anchor = Some(block_start_byte + next_line_actual_size + offset_in_block);
+            }
+        }
+        
+        // Record the operation for undo
+        self.push_op(EditOp::Delete { pos: block_start_byte, text: original_content }, before_caret, self.caret);
+        self.push_op(EditOp::Insert { pos: block_start_byte, text: new_content }, before_caret, self.caret);
+        
+        self.invalidate_visual_lines();
+        let (_, col) = self.get_visual_position(self.caret, viewport_width);
+        self.preferred_col = col;
+    }
+
     fn select_all(&mut self) {
         self.selection_anchor = Some(0);
         self.caret = self.rope.len_bytes();
@@ -2278,12 +2458,22 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                 editor.update_viewport(viewport_height, viewport_width);
                             }
                             KeyCode::Up => {
-                                editor.move_up(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
-                                editor.update_viewport(viewport_height, viewport_width);
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) && key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                    editor.move_lines_up(viewport_width);
+                                    editor.update_viewport(viewport_height, viewport_width);
+                                } else {
+                                    editor.move_up(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
+                                    editor.update_viewport(viewport_height, viewport_width);
+                                }
                             }
                             KeyCode::Down => {
-                                editor.move_down(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
-                                editor.update_viewport(viewport_height, viewport_width);
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) && key.modifiers.contains(event::KeyModifiers::SHIFT) {
+                                    editor.move_lines_down(viewport_width);
+                                    editor.update_viewport(viewport_height, viewport_width);
+                                } else {
+                                    editor.move_down(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
+                                    editor.update_viewport(viewport_height, viewport_width);
+                                }
                             }
                             _ => {}
                         }
