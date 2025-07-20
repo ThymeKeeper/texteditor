@@ -5,6 +5,9 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
+
+#[cfg(target_os = "windows")]
+use crossterm::event::KeyEventKind;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -2175,6 +2178,15 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
         
         match event::read()? {
             Event::Key(key) => {
+                // On Windows, ignore key release events to prevent double input
+                // We only process Press events and Repeat events
+                #[cfg(target_os = "windows")]
+                {
+                    if key.kind == KeyEventKind::Release {
+                        continue;
+                    }
+                }
+                
                 let size = terminal.size()?;
                 let viewport_width = size.width as usize;
                 let viewport_height = size.height as usize - 1;
