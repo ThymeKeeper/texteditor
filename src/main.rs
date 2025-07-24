@@ -2155,7 +2155,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
+fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> 
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let mut editor = Editor::new();
     
     if let Some(filename) = env::args().nth(1) {
@@ -2170,7 +2173,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     execute!(io::stdout(), SetTitle(&editor.get_display_name()))?;
     
     loop {
-        terminal.draw(|f| draw_ui(f, &mut editor))?;
+        terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         
         if let AppState::Exiting = editor.app_state {
             return Ok(());
@@ -2187,7 +2190,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                     }
                 }
                 
-                let size = terminal.size()?;
+                let size = terminal.size().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                 let viewport_width = size.width as usize;
                 let viewport_height = size.height as usize - 1;
                 
@@ -2522,7 +2525,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                 match &mut editor.app_state {
                     AppState::Prompting(prompt) => {
                         // Get the prompt area coordinates
-                        let area = centered_rect(60, 20, terminal.size()?);
+                        let size = terminal.size().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                        let area = centered_rect(60, 20, Rect::new(0, 0, size.width, size.height));
                         let inner = Block::default()
                             .borders(Borders::ALL)
                             .inner(area);
@@ -2558,7 +2562,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                         }
                     }
                     AppState::Editing => {
-                        let size = terminal.size()?;
+                        let size = terminal.size().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                         match mouse.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
                                 let chunks = Layout::default()
@@ -2567,7 +2571,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                         Constraint::Min(0),
                                         Constraint::Length(1),
                                     ])
-                                    .split(size);
+                                    .split(Rect::new(0, 0, size.width, size.height));
                                 
                                 let shift_held = mouse.modifiers.contains(event::KeyModifiers::SHIFT);
                                 editor.handle_click(mouse.column, mouse.row, chunks[0], size.width as usize, shift_held);
@@ -2585,7 +2589,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                             Constraint::Min(0),
                                             Constraint::Length(1),
                                         ])
-                                        .split(size);
+                                        .split(Rect::new(0, 0, size.width, size.height));
                                     
                                     let click_row = editor.viewport_offset.0 + mouse.row.saturating_sub(chunks[0].y) as usize;
                                     let click_col = editor.viewport_offset.1 + mouse.column.saturating_sub(chunks[0].x) as usize;
@@ -2621,7 +2625,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                 }
             }
             Event::Resize(_, _) => {
-                let size = terminal.size()?;
+                let size = terminal.size().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                 editor.invalidate_visual_lines();
                 editor.logical_line_map.clear();
                 editor.update_viewport(size.height as usize - 1, size.width as usize);
@@ -2711,7 +2715,7 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
             Constraint::Min(0),
             Constraint::Length(1),
         ])
-        .split(f.size());
+        .split(f.area());
     
     let viewport_height = chunks[0].height as usize;
     let viewport_width = chunks[0].width as usize;
@@ -2830,7 +2834,7 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     if let AppState::Prompting(prompt) = &mut editor.app_state {
         match prompt.prompt_type {
             PromptType::SaveAs => {
-                let area = centered_rect(60, 20, f.size());
+                let area = centered_rect(60, 20, f.area());
                 f.render_widget(Clear, area);
                 
                 let block = Block::default()
@@ -2898,10 +2902,10 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                 }
                 let screen_pos = visual_cursor_pos.saturating_sub(prompt.save_as_scroll_offset);
                 let cursor_x = input_area[1].x + screen_pos.min(input_area[1].width as usize - 1) as u16;
-                f.set_cursor(cursor_x, input_area[1].y);
+                f.set_cursor_position((cursor_x, input_area[1].y));
             }
             PromptType::ConfirmSave => {
-                let area = centered_rect(60, 20, f.size());
+                let area = centered_rect(60, 20, f.area());
                 f.render_widget(Clear, area);
                 
                 let block = Block::default()
@@ -2924,7 +2928,7 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                         Constraint::Length(3),
                         Constraint::Length(1),
                     ])
-                    .split(f.size());
+                    .split(f.area());
                 
                 let find_replace_area = find_replace_chunks[1];
                 f.render_widget(Clear, find_replace_area);
@@ -3074,7 +3078,7 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                         }
                         _ => unreachable!(),
                     };
-                    f.set_cursor(cursor_field.0, cursor_field.1);
+                    f.set_cursor_position((cursor_field.0, cursor_field.1));
                 } else {
                     // When buffer has focus, set cursor in the editor area
                     let (caret_row, caret_col) = editor.get_visual_position(editor.caret, viewport_width);
@@ -3087,10 +3091,10 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                         };
                         
                         if screen_col < viewport_width {
-                            f.set_cursor(
+                            f.set_cursor_position((
                                 find_replace_chunks[0].x + screen_col as u16,
                                 find_replace_chunks[0].y + screen_row as u16,
-                            );
+                            ));
                         }
                     }
                 }
@@ -3151,10 +3155,10 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
             };
             
             if screen_col < viewport_width {
-                f.set_cursor(
+                f.set_cursor_position((
                     chunks[0].x + screen_col as u16,
                     chunks[0].y + screen_row as u16,
-                );
+                ));
             }
         }
     }
