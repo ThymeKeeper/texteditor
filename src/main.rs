@@ -2155,10 +2155,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> 
-where
-    B::Error: std::error::Error + Send + Sync + 'static,
-{
+fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     let mut editor = Editor::new();
     
     if let Some(filename) = env::args().nth(1) {
@@ -2828,6 +2825,7 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     }
     
     let paragraph = Paragraph::new(lines.clone());
+    f.render_widget(Clear, chunks[0]);
     f.render_widget(paragraph, chunks[0]);
     
     // Draw prompt if active
@@ -3101,6 +3099,7 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                 
                 // Still render the main editor area above the find/replace bar
                 let editor_paragraph = Paragraph::new(lines.clone());
+                f.render_widget(Clear, find_replace_chunks[0]);
                 f.render_widget(editor_paragraph, find_replace_chunks[0]);
                 
                 // Render status bar below find/replace
