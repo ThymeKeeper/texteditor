@@ -862,6 +862,8 @@ struct Editor {
     app_state: AppState,
     find_matches: Vec<(usize, usize)>,
     current_match_index: Option<usize>,
+    #[cfg(target_os = "windows")]
+    previous_viewport_offset: (usize, usize),
 }
 
 impl Editor {
@@ -891,6 +893,8 @@ impl Editor {
             app_state: AppState::Editing,
             find_matches: Vec::new(),
             current_match_index: None,
+            #[cfg(target_os = "windows")]
+            previous_viewport_offset: (0, 0),
         };
         editor.invalidate_visual_lines();
         editor
@@ -2717,8 +2721,17 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     let viewport_height = chunks[0].height as usize;
     let viewport_width = chunks[0].width as usize;
     
+    // Windows-specific: Check if viewport has changed for more aggressive clearing
+    #[cfg(target_os = "windows")]
+    let viewport_changed = editor.viewport_offset != editor.previous_viewport_offset;
+    
     editor.ensure_visual_lines(viewport_width);
     editor.update_viewport(viewport_height, viewport_width);
+    
+    #[cfg(target_os = "windows")]
+    {
+        editor.previous_viewport_offset = editor.viewport_offset;
+    }
     
     let selection_range = editor.get_selection_range();
     
@@ -2813,18 +2826,63 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                     spans.push(Span::styled(ch.to_string(), char_styles[i]));
                 }
                 
+                // Windows-specific: Pad line to full width to ensure clearing
+                #[cfg(target_os = "windows")]
+                {
+                    let line_width: usize = spans.iter().map(|s| s.content.width()).sum();
+                    if line_width < viewport_width {
+                        spans.push(Span::raw(" ".repeat(viewport_width - line_width)));
+                    }
+                }
+                
                 lines.push(Line::from(spans));
             } else {
-                lines.push(Line::from(vec![Span::styled("~", Style::default().fg(Color::DarkGray))]));
+                // Windows-specific: Fill empty lines with spaces
+                #[cfg(target_os = "windows")]
+                {
+                    lines.push(Line::from(vec![
+                        Span::styled("~", Style::default().fg(Color::DarkGray)),
+                        Span::raw(" ".repeat(viewport_width.saturating_sub(1)))
+                    ]));
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    lines.push(Line::from(vec![Span::styled("~", Style::default().fg(Color::DarkGray))]));
+                }
             }
         }
     }
     
     while lines.len() < viewport_height {
-        lines.push(Line::default());
+        // Windows-specific: Fill with spaces instead of empty lines
+        #[cfg(target_os = "windows")]
+        {
+            lines.push(Line::from(" ".repeat(viewport_width)));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            lines.push(Line::default());
+        }
     }
     
     let paragraph = Paragraph::new(lines.clone());
+    
+    // Windows-specific: More aggressive clearing on viewport changes
+    #[cfg(target_os = "windows")]
+    {
+        if viewport_changed {
+            // Clear the entire editor area when scrolling
+            f.render_widget(Clear, chunks[0]);
+            
+            // Additionally, fill the area with spaces to force clearing
+            let empty_lines: Vec<Line> = (0..viewport_height)
+                .map(|_| Line::from(" ".repeat(viewport_width)))
+                .collect();
+            let clear_paragraph = Paragraph::new(empty_lines);
+            f.render_widget(clear_paragraph, chunks[0]);
+        }
+    }
+    
     f.render_widget(Clear, chunks[0]);
     f.render_widget(paragraph, chunks[0]);
     
