@@ -868,6 +868,7 @@ struct Editor {
     app_state: AppState,
     find_matches: Vec<(usize, usize)>,
     current_match_index: Option<usize>,
+    viewport_follows_caret: bool,
     #[cfg(target_os = "windows")]
     previous_viewport_offset: (usize, usize),
     #[cfg(target_os = "windows")]
@@ -901,6 +902,7 @@ impl Editor {
             app_state: AppState::Editing,
             find_matches: Vec::new(),
             current_match_index: None,
+            viewport_follows_caret: true,
             #[cfg(target_os = "windows")]
             previous_viewport_offset: (0, 0),
             #[cfg(target_os = "windows")]
@@ -1359,6 +1361,7 @@ impl Editor {
     }
 
     fn move_up(&mut self, viewport_width: usize, extend_selection: bool) {
+        self.enable_viewport_following();
         if extend_selection && self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.caret);
         } else if !extend_selection {
@@ -1374,6 +1377,7 @@ impl Editor {
     }
 
     fn move_down(&mut self, viewport_width: usize, extend_selection: bool) {
+        self.enable_viewport_following();
         if extend_selection && self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.caret);
         } else if !extend_selection {
@@ -1394,6 +1398,7 @@ impl Editor {
     }
 
     fn move_left(&mut self, viewport_width: usize, extend_selection: bool) {
+        self.enable_viewport_following();
         if !extend_selection && self.has_selection() {
             if let Some((start, _)) = self.get_selection_range() {
                 self.caret = start;
@@ -1421,6 +1426,7 @@ impl Editor {
     }
 
     fn move_right(&mut self, viewport_width: usize, extend_selection: bool) {
+        self.enable_viewport_following();
         if !extend_selection && self.has_selection() {
             if let Some((_, end)) = self.get_selection_range() {
                 self.caret = end;
@@ -1448,6 +1454,7 @@ impl Editor {
     }
 
     fn insert_char(&mut self, ch: char, viewport_width: usize) {
+        self.enable_viewport_following();
         self.delete_selection();
 
         let before = self.caret;
@@ -1463,6 +1470,7 @@ impl Editor {
     }
 
     fn delete(&mut self, _viewport_width: usize) {
+        self.enable_viewport_following();
         if self.delete_selection() {
             return;
         }
@@ -1482,6 +1490,7 @@ impl Editor {
     }
 
     fn backspace(&mut self, _viewport_width: usize) {
+        self.enable_viewport_following();
         if self.delete_selection() {
             return;
         }
@@ -1893,28 +1902,80 @@ impl Editor {
         }
     }
 
-    fn update_viewport(&mut self, height: usize, width: usize) {
-        self.ensure_visual_lines(width);
-        let (row, col) = self.get_visual_position(self.caret, width);
+    fn enable_viewport_following(&mut self) {
+        self.viewport_follows_caret = true;
+    }
+    
+    fn page_up(&mut self, viewport_width: usize, viewport_height: usize, extend_selection: bool) {
+        self.enable_viewport_following();
         
-        if row < self.viewport_offset.0 + self.scrolloff {
-            self.viewport_offset.0 = row.saturating_sub(self.scrolloff);
-        } else if row >= self.viewport_offset.0 + height - self.scrolloff {
-            self.viewport_offset.0 = row + self.scrolloff + 1 - height;
+        if extend_selection && self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.caret);
+        } else if !extend_selection {
+            self.clear_selection();
         }
         
-        if !self.word_wrap {
-            if col < self.viewport_offset.1 + self.scrolloff {
-                self.viewport_offset.1 = col.saturating_sub(self.scrolloff);
-            } else if col >= self.viewport_offset.1 + width - self.scrolloff {
-                self.viewport_offset.1 = col + self.scrolloff + 1 - width;
-            }
+        let (current_row, _) = self.get_visual_position(self.caret, viewport_width);
+        let page_size = viewport_height.saturating_sub(2);
+        
+        if current_row <= self.virtual_lines {
+            // Already at top, move to beginning of document
+            self.caret = 0;
         } else {
-            self.viewport_offset.1 = 0;
+            let target_row = current_row.saturating_sub(page_size).max(self.virtual_lines);
+            self.caret = self.visual_to_byte(target_row, self.preferred_col, viewport_width);
+        }
+    }
+    
+    fn page_down(&mut self, viewport_width: usize, viewport_height: usize, extend_selection: bool) {
+        self.enable_viewport_following();
+        
+        if extend_selection && self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.caret);
+        } else if !extend_selection {
+            self.clear_selection();
+        }
+        
+        let (current_row, _) = self.get_visual_position(self.caret, viewport_width);
+        let page_size = viewport_height.saturating_sub(2);
+        let total_lines = self.visual_lines.len();
+        let last_content_line = total_lines.saturating_sub(self.virtual_lines + 1);
+        
+        if current_row >= last_content_line {
+            // Already at bottom, move to end of document
+            self.caret = self.rope.len_bytes();
+        } else {
+            let target_row = (current_row + page_size).min(last_content_line);
+            self.caret = self.visual_to_byte(target_row, self.preferred_col, viewport_width);
+        }
+    }
+    
+    fn update_viewport(&mut self, height: usize, width: usize) {
+        self.ensure_visual_lines(width);
+        
+        if self.viewport_follows_caret {
+            let (row, col) = self.get_visual_position(self.caret, width);
+            
+            if row < self.viewport_offset.0 + self.scrolloff {
+                self.viewport_offset.0 = row.saturating_sub(self.scrolloff);
+            } else if row >= self.viewport_offset.0 + height - self.scrolloff {
+                self.viewport_offset.0 = row + self.scrolloff + 1 - height;
+            }
+            
+            if !self.word_wrap {
+                if col < self.viewport_offset.1 + self.scrolloff {
+                    self.viewport_offset.1 = col.saturating_sub(self.scrolloff);
+                } else if col >= self.viewport_offset.1 + width - self.scrolloff {
+                    self.viewport_offset.1 = col + self.scrolloff + 1 - width;
+                }
+            } else {
+                self.viewport_offset.1 = 0;
+            }
         }
     }
 
     fn handle_click(&mut self, col: u16, row: u16, area: Rect, viewport_width: usize, shift_held: bool) {
+        self.enable_viewport_following();
         self.ensure_visual_lines(viewport_width);
         let click_row = self.viewport_offset.0 + row.saturating_sub(area.y) as usize;
         let click_col = self.viewport_offset.1 + col.saturating_sub(area.x) as usize;
@@ -2606,6 +2667,14 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                     editor.update_viewport(viewport_height, viewport_width);
                                 }
                             }
+                            KeyCode::PageUp => {
+                                editor.page_up(viewport_width, viewport_height, key.modifiers.contains(event::KeyModifiers::SHIFT));
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
+                            KeyCode::PageDown => {
+                                editor.page_down(viewport_width, viewport_height, key.modifiers.contains(event::KeyModifiers::SHIFT));
+                                editor.update_viewport(viewport_height, viewport_width);
+                            }
                             _ => {}
                         }
                         
@@ -2706,10 +2775,12 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                             }
                             MouseEventKind::ScrollUp => {
                                 editor.viewport_offset.0 = editor.viewport_offset.0.saturating_sub(3);
+                                editor.viewport_follows_caret = false;
                             }
                             MouseEventKind::ScrollDown => {
                                 let max = editor.visual_lines.len().saturating_sub(size.height as usize - 1);
                                 editor.viewport_offset.0 = (editor.viewport_offset.0 + 3).min(max);
+                                editor.viewport_follows_caret = false;
                             }
                             _ => {}
                         }
@@ -2793,6 +2864,14 @@ fn handle_editor_key(editor: &mut Editor, key: event::KeyEvent, viewport_width: 
         }
         KeyCode::Down => {
             editor.move_down(viewport_width, key.modifiers.contains(event::KeyModifiers::SHIFT));
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::PageUp => {
+            editor.page_up(viewport_width, viewport_height, key.modifiers.contains(event::KeyModifiers::SHIFT));
+            editor.update_viewport(viewport_height, viewport_width);
+        }
+        KeyCode::PageDown => {
+            editor.page_down(viewport_width, viewport_height, key.modifiers.contains(event::KeyModifiers::SHIFT));
             editor.update_viewport(viewport_height, viewport_width);
         }
         _ => {}
