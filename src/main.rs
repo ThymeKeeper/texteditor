@@ -2836,9 +2836,12 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                 // Windows-specific: Pad line to full width to ensure clearing
                 #[cfg(target_os = "windows")]
                 {
-                    let line_width: usize = spans.iter().map(|s| s.content.width()).sum();
-                    if line_width < viewport_width {
-                        spans.push(Span::raw(" ".repeat(viewport_width - line_width)));
+                    // Calculate the actual displayed character count including indent
+                    let total_width = vline.indent + display_text.chars().count();
+                    if total_width < viewport_width {
+                        // Pad with spaces to fill the entire viewport width
+                        let padding_needed = viewport_width - total_width;
+                        spans.push(Span::raw(" ".repeat(padding_needed)));
                     }
                 }
                 
@@ -2874,23 +2877,22 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     
     let paragraph = Paragraph::new(lines.clone());
     
-    // Windows-specific: More aggressive clearing only when viewport changes
+    // Windows-specific: Always do aggressive clearing
     #[cfg(target_os = "windows")]
     {
-        if viewport_changed {
-            // First clear with Clear widget
-            f.render_widget(Clear, chunks[0]);
-            
-            // Then render a paragraph full of spaces to force clearing
-            let empty_lines: Vec<Line> = (0..viewport_height)
-                .map(|_| Line::from(" ".repeat(viewport_width)))
-                .collect();
-            let clear_paragraph = Paragraph::new(empty_lines);
-            f.render_widget(clear_paragraph, chunks[0]);
-        }
+        // First clear with Clear widget
+        f.render_widget(Clear, chunks[0]);
+        
+        // Then render a paragraph full of spaces to force clearing
+        // This ensures every cell is written to
+        let empty_lines: Vec<Line> = (0..viewport_height)
+            .map(|_| Line::from(" ".repeat(viewport_width)))
+            .collect();
+        let clear_paragraph = Paragraph::new(empty_lines);
+        f.render_widget(clear_paragraph, chunks[0]);
     }
     
-    // Always clear before rendering
+    // Clear before rendering on all platforms
     f.render_widget(Clear, chunks[0]);
     f.render_widget(paragraph, chunks[0]);
     
