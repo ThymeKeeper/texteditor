@@ -6,6 +6,11 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
 };
 
+#[cfg(target_os = "windows")]
+use crossterm::{
+    cursor::MoveTo,
+    terminal::{Clear as ClearType, ClearType as CrosstermClearType},
+};
 
 #[cfg(target_os = "windows")]
 use crossterm::event::KeyEventKind;
@@ -2181,7 +2186,23 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     execute!(io::stdout(), SetTitle(&editor.get_display_name()))?;
     
     loop {
-        terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        // Windows-specific: Force full redraw on viewport changes
+        #[cfg(target_os = "windows")]
+        {
+            let current_offset = editor.viewport_offset;
+            terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            
+            // If viewport changed, force another draw to ensure proper clearing
+            if current_offset != editor.viewport_offset {
+                // Skip terminal.clear() to reduce flicker - the draw_ui clearing should be sufficient
+                terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
         
         if let AppState::Exiting = editor.app_state {
             return Ok(());
@@ -2728,7 +2749,7 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     let viewport_height = chunks[0].height as usize;
     let viewport_width = chunks[0].width as usize;
     
-    // Windows-specific: Check if viewport has changed
+    // Windows-specific: Check if viewport has changed for more aggressive clearing
     #[cfg(target_os = "windows")]
     let viewport_changed = editor.viewport_offset != editor.previous_viewport_offset;
     
@@ -2737,6 +2758,17 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     
     #[cfg(target_os = "windows")]
     {
+        // If viewport changed, use direct crossterm commands to clear the area
+        if viewport_changed {
+            // Clear each line in the editor area directly
+            for y in 0..viewport_height {
+                let _ = execute!(
+                    io::stdout(),
+                    MoveTo(chunks[0].x, chunks[0].y + y as u16),
+                    ClearType(CrosstermClearType::UntilNewLine)
+                );
+            }
+        }
         editor.previous_viewport_offset = editor.viewport_offset;
     }
     
@@ -2836,12 +2868,9 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                 // Windows-specific: Pad line to full width to ensure clearing
                 #[cfg(target_os = "windows")]
                 {
-                    // Calculate the actual displayed character count including indent
-                    let total_width = vline.indent + display_text.chars().count();
-                    if total_width < viewport_width {
-                        // Pad with spaces to fill the entire viewport width
-                        let padding_needed = viewport_width - total_width;
-                        spans.push(Span::raw(" ".repeat(padding_needed)));
+                    let line_width: usize = spans.iter().map(|s| s.content.width()).sum();
+                    if line_width < viewport_width {
+                        spans.push(Span::raw(" ".repeat(viewport_width - line_width)));
                     }
                 }
                 
@@ -2877,23 +2906,39 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     
     let paragraph = Paragraph::new(lines.clone());
     
-    // Windows-specific: Always do aggressive clearing
+    // Windows-specific: More aggressive clearing on viewport changes
     #[cfg(target_os = "windows")]
     {
-        // First clear with Clear widget
-        f.render_widget(Clear, chunks[0]);
-        
-        // Then render a paragraph full of spaces to force clearing
-        // This ensures every cell is written to
-        let empty_lines: Vec<Line> = (0..viewport_height)
-            .map(|_| Line::from(" ".repeat(viewport_width)))
-            .collect();
-        let clear_paragraph = Paragraph::new(empty_lines);
-        f.render_widget(clear_paragraph, chunks[0]);
+        if viewport_changed {
+            // Method 1: Clear widget
+            f.render_widget(Clear, chunks[0]);
+            
+            // Method 2: Fill with spaces using a styled block
+            let empty_block = Block::default()
+                .style(Style::default().bg(Color::Black))
+                .borders(Borders::NONE);
+            f.render_widget(empty_block, chunks[0]);
+            
+            // Method 3: Render empty paragraph with explicit spaces
+            let mut empty_lines: Vec<Line> = Vec::with_capacity(viewport_height);
+            for _ in 0..viewport_height {
+                let mut spans = Vec::with_capacity(viewport_width);
+                for _ in 0..viewport_width {
+                    spans.push(Span::styled(" ", Style::default().bg(Color::Black)));
+                }
+                empty_lines.push(Line::from(spans));
+            }
+            let clear_paragraph = Paragraph::new(empty_lines);
+            f.render_widget(clear_paragraph, chunks[0]);
+        }
     }
     
-    // Clear before rendering on all platforms
-    f.render_widget(Clear, chunks[0]);
+    // Always clear before rendering on Windows
+    #[cfg(target_os = "windows")]
+    {
+        f.render_widget(Clear, chunks[0]);
+    }
+    
     f.render_widget(paragraph, chunks[0]);
     
     // Draw prompt if active
