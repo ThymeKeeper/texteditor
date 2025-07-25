@@ -2273,6 +2273,22 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                         editor.update_viewport(viewport_height, viewport_width);
                                     }
                                 }
+                                KeyCode::Char('q') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                    // Dismiss the modal first
+                                    editor.clear_find_matches();
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        editor.modal_just_dismissed = true;
+                                    }
+                                    editor.app_state = AppState::Editing;
+                                    
+                                    // Then follow normal Ctrl+Q behavior
+                                    if editor.modified {
+                                        editor.app_state = AppState::Prompting(Prompt::new_confirm_save());
+                                    } else {
+                                        return Ok(());
+                                    }
+                                }
                                 _ => {
                                     // Handle normal editor commands
                                     handle_editor_key(&mut editor, key, viewport_width, viewport_height)?;
@@ -2331,6 +2347,24 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                             }
                             KeyCode::Char('v') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                                 prompt.paste();
+                            }
+                            KeyCode::Char('q') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                // Dismiss the modal first
+                                if matches!(prompt.prompt_type, PromptType::FindReplace) {
+                                    editor.clear_find_matches();
+                                }
+                                #[cfg(target_os = "windows")]
+                                {
+                                    editor.modal_just_dismissed = true;
+                                }
+                                editor.app_state = AppState::Editing;
+                                
+                                // Then follow normal Ctrl+Q behavior
+                                if editor.modified {
+                                    editor.app_state = AppState::Prompting(Prompt::new_confirm_save());
+                                } else {
+                                    return Ok(());
+                                }
                             }
                             KeyCode::Tab if matches!(prompt.prompt_type, PromptType::FindReplace) => {
                                 // Switch between find, replace, and buffer
@@ -2791,8 +2825,11 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     
     #[cfg(target_os = "windows")]
     {
-        // If viewport changed or modal was dismissed, use direct crossterm commands to clear the area
-        if viewport_changed || modal_dismissed {
+        // Only clear if viewport changed AND we're not showing a modal
+        // OR if a modal was just dismissed
+        let should_clear = modal_dismissed || (viewport_changed && matches!(editor.app_state, AppState::Editing));
+        
+        if should_clear {
             // Clear each line in the editor area directly
             for y in 0..viewport_height {
                 let _ = execute!(
@@ -2801,8 +2838,6 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                     ClearType(CrosstermClearType::UntilNewLine)
                 );
             }
-            
-            // Terminal clearing for modal dismissal is now handled in the main loop
         }
         editor.previous_viewport_offset = editor.viewport_offset;
         editor.modal_just_dismissed = false;
@@ -2945,7 +2980,8 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     // Windows-specific: More aggressive clearing on viewport changes or modal dismissal
     #[cfg(target_os = "windows")]
     {
-        if viewport_changed || modal_dismissed {
+        let should_clear = modal_dismissed || (viewport_changed && matches!(editor.app_state, AppState::Editing));
+        if should_clear {
             // Method 1: Clear widget
             f.render_widget(Clear, chunks[0]);
             
