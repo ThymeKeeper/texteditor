@@ -2189,10 +2189,17 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     execute!(io::stdout(), SetTitle(&editor.get_display_name()))?;
     
     loop {
-        // Windows-specific: Force full redraw on viewport changes
+        // Windows-specific: Force full redraw on viewport changes or modal dismissal
         #[cfg(target_os = "windows")]
         {
             let current_offset = editor.viewport_offset;
+            let was_modal_dismissed = editor.modal_just_dismissed;
+            
+            // If modal was just dismissed, clear terminal before drawing
+            if was_modal_dismissed {
+                terminal.clear().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
+            
             terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             
             // If viewport changed, force another draw to ensure proper clearing
@@ -2795,13 +2802,7 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                 );
             }
             
-            // Also clear the entire terminal if modal was dismissed
-            if modal_dismissed {
-                let _ = execute!(
-                    io::stdout(),
-                    ClearType(CrosstermClearType::All)
-                );
-            }
+            // Terminal clearing for modal dismissal is now handled in the main loop
         }
         editor.previous_viewport_offset = editor.viewport_offset;
         editor.modal_just_dismissed = false;
