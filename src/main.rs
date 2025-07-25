@@ -2799,7 +2799,7 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
             if modal_dismissed {
                 let _ = execute!(
                     io::stdout(),
-                    Clear(CrosstermClearType::All)
+                    ClearType(CrosstermClearType::All)
                 );
             }
         }
