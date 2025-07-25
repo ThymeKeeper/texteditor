@@ -870,6 +870,8 @@ struct Editor {
     current_match_index: Option<usize>,
     #[cfg(target_os = "windows")]
     previous_viewport_offset: (usize, usize),
+    #[cfg(target_os = "windows")]
+    modal_just_dismissed: bool,
 }
 
 impl Editor {
@@ -901,6 +903,8 @@ impl Editor {
             current_match_index: None,
             #[cfg(target_os = "windows")]
             previous_viewport_offset: (0, 0),
+            #[cfg(target_os = "windows")]
+            modal_just_dismissed: false,
         };
         editor.invalidate_visual_lines();
         editor
@@ -1970,12 +1974,11 @@ impl Editor {
         }
 
         let text = self.rope.to_string();
-        let query_bytes = query.as_bytes();
+        let query_lower = query.to_lowercase();
+        let text_lower = text.to_lowercase();
         
-        for (idx, window) in text.as_bytes().windows(query_bytes.len()).enumerate() {
-            if window == query_bytes {
-                self.find_matches.push((idx, idx + query_bytes.len()));
-            }
+        for (idx, _) in text_lower.match_indices(&query_lower) {
+            self.find_matches.push((idx, idx + query.len()));
         }
 
         if !self.find_matches.is_empty() {
@@ -2231,6 +2234,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                             match key.code {
                                 KeyCode::Esc => {
                                     editor.clear_find_matches();
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        editor.modal_just_dismissed = true;
+                                    }
                                     editor.app_state = AppState::Editing;
                                 }
                                 KeyCode::Tab => {
@@ -2271,6 +2278,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                     if matches!(prompt.prompt_type, PromptType::FindReplace) {
                                         editor.clear_find_matches();
                                     }
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        editor.modal_just_dismissed = true;
+                                    }
                                     editor.app_state = AppState::Editing;
                                 }
                             KeyCode::Enter => {
@@ -2285,6 +2296,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                                 execute!(io::stdout(), SetTitle(&editor.get_display_name()))?;
                                             }
                                             editor.clear_find_matches();
+                                            #[cfg(target_os = "windows")]
+                                            {
+                                                editor.modal_just_dismissed = true;
+                                            }
                                             editor.app_state = AppState::Editing;
                                         }
                                     }
@@ -2348,6 +2363,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                     editor.replace_all(&query, &replacement, viewport_width);
                                     editor.update_viewport(viewport_height, viewport_width);
                                     editor.clear_find_matches();
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        editor.modal_just_dismissed = true;
+                                    }
                                     editor.app_state = AppState::Editing;
                                 } else {
                                     // Replace current and find next
@@ -2377,6 +2396,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                             'c' => {
                                                 if matches!(prompt.prompt_type, PromptType::FindReplace) {
                                                     editor.clear_find_matches();
+                                                }
+                                                #[cfg(target_os = "windows")]
+                                                {
+                                                    editor.modal_just_dismissed = true;
                                                 }
                                                 editor.app_state = AppState::Editing;
                                             }
@@ -2749,17 +2772,20 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     let viewport_height = chunks[0].height as usize;
     let viewport_width = chunks[0].width as usize;
     
-    // Windows-specific: Check if viewport has changed for more aggressive clearing
+    // Windows-specific: Check if viewport has changed or modal was just dismissed for more aggressive clearing
     #[cfg(target_os = "windows")]
     let viewport_changed = editor.viewport_offset != editor.previous_viewport_offset;
+    
+    #[cfg(target_os = "windows")]
+    let modal_dismissed = editor.modal_just_dismissed;
     
     editor.ensure_visual_lines(viewport_width);
     editor.update_viewport(viewport_height, viewport_width);
     
     #[cfg(target_os = "windows")]
     {
-        // If viewport changed, use direct crossterm commands to clear the area
-        if viewport_changed {
+        // If viewport changed or modal was dismissed, use direct crossterm commands to clear the area
+        if viewport_changed || modal_dismissed {
             // Clear each line in the editor area directly
             for y in 0..viewport_height {
                 let _ = execute!(
@@ -2768,8 +2794,17 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                     ClearType(CrosstermClearType::UntilNewLine)
                 );
             }
+            
+            // Also clear the entire terminal if modal was dismissed
+            if modal_dismissed {
+                let _ = execute!(
+                    io::stdout(),
+                    Clear(CrosstermClearType::All)
+                );
+            }
         }
         editor.previous_viewport_offset = editor.viewport_offset;
+        editor.modal_just_dismissed = false;
     }
     
     let selection_range = editor.get_selection_range();
@@ -2906,10 +2941,10 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     
     let paragraph = Paragraph::new(lines.clone());
     
-    // Windows-specific: More aggressive clearing on viewport changes
+    // Windows-specific: More aggressive clearing on viewport changes or modal dismissal
     #[cfg(target_os = "windows")]
     {
-        if viewport_changed {
+        if viewport_changed || modal_dismissed {
             // Method 1: Clear widget
             f.render_widget(Clear, chunks[0]);
             
