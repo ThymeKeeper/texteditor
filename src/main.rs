@@ -2728,6 +2728,9 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     let viewport_height = chunks[0].height as usize;
     let viewport_width = chunks[0].width as usize;
     
+    // Windows-specific: Check if viewport has changed
+    #[cfg(target_os = "windows")]
+    let viewport_changed = editor.viewport_offset != editor.previous_viewport_offset;
     
     editor.ensure_visual_lines(viewport_width);
     editor.update_viewport(viewport_height, viewport_width);
@@ -2871,7 +2874,23 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     
     let paragraph = Paragraph::new(lines.clone());
     
-    // Clear before rendering - works for both Windows and Linux
+    // Windows-specific: More aggressive clearing only when viewport changes
+    #[cfg(target_os = "windows")]
+    {
+        if viewport_changed {
+            // First clear with Clear widget
+            f.render_widget(Clear, chunks[0]);
+            
+            // Then render a paragraph full of spaces to force clearing
+            let empty_lines: Vec<Line> = (0..viewport_height)
+                .map(|_| Line::from(" ".repeat(viewport_width)))
+                .collect();
+            let clear_paragraph = Paragraph::new(empty_lines);
+            f.render_widget(clear_paragraph, chunks[0]);
+        }
+    }
+    
+    // Always clear before rendering
     f.render_widget(Clear, chunks[0]);
     f.render_widget(paragraph, chunks[0]);
     
