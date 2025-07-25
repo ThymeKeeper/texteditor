@@ -7,6 +7,12 @@ use crossterm::{
 };
 
 #[cfg(target_os = "windows")]
+use crossterm::{
+    cursor::MoveTo,
+    terminal::{Clear as ClearType, ClearType as CrosstermClearType},
+};
+
+#[cfg(target_os = "windows")]
 use crossterm::event::KeyEventKind;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
@@ -2141,6 +2147,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     
+    // Windows-specific: Disable buffer optimization to force full redraws
+    #[cfg(target_os = "windows")]
+    {
+        terminal.autoresize()?;
+    }
+    
     let result = run_app(&mut terminal);
     
     disable_raw_mode()?;
@@ -2174,7 +2186,23 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     execute!(io::stdout(), SetTitle(&editor.get_display_name()))?;
     
     loop {
-        terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        // Windows-specific: Force full redraw on viewport changes
+        #[cfg(target_os = "windows")]
+        {
+            let current_offset = editor.viewport_offset;
+            terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            
+            // If viewport changed, force another draw to ensure proper clearing
+            if current_offset != editor.viewport_offset {
+                terminal.clear().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            }
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
         
         if let AppState::Exiting = editor.app_state {
             return Ok(());
@@ -2730,6 +2758,17 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     
     #[cfg(target_os = "windows")]
     {
+        // If viewport changed, use direct crossterm commands to clear the area
+        if viewport_changed {
+            // Clear each line in the editor area directly
+            for y in 0..viewport_height {
+                let _ = execute!(
+                    io::stdout(),
+                    MoveTo(chunks[0].x, chunks[0].y + y as u16),
+                    ClearType(CrosstermClearType::UntilNewLine)
+                );
+            }
+        }
         editor.previous_viewport_offset = editor.viewport_offset;
     }
     
@@ -2871,19 +2910,35 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
     #[cfg(target_os = "windows")]
     {
         if viewport_changed {
-            // Clear the entire editor area when scrolling
+            // Method 1: Clear widget
             f.render_widget(Clear, chunks[0]);
             
-            // Additionally, fill the area with spaces to force clearing
-            let empty_lines: Vec<Line> = (0..viewport_height)
-                .map(|_| Line::from(" ".repeat(viewport_width)))
-                .collect();
+            // Method 2: Fill with spaces using a styled block
+            let empty_block = Block::default()
+                .style(Style::default().bg(Color::Black))
+                .borders(Borders::NONE);
+            f.render_widget(empty_block, chunks[0]);
+            
+            // Method 3: Render empty paragraph with explicit spaces
+            let mut empty_lines: Vec<Line> = Vec::with_capacity(viewport_height);
+            for _ in 0..viewport_height {
+                let mut spans = Vec::with_capacity(viewport_width);
+                for _ in 0..viewport_width {
+                    spans.push(Span::styled(" ", Style::default().bg(Color::Black)));
+                }
+                empty_lines.push(Line::from(spans));
+            }
             let clear_paragraph = Paragraph::new(empty_lines);
             f.render_widget(clear_paragraph, chunks[0]);
         }
     }
     
-    f.render_widget(Clear, chunks[0]);
+    // Always clear before rendering on Windows
+    #[cfg(target_os = "windows")]
+    {
+        f.render_widget(Clear, chunks[0]);
+    }
+    
     f.render_widget(paragraph, chunks[0]);
     
     // Draw prompt if active
