@@ -2265,14 +2265,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
             
             // If viewport changed, force another draw to ensure proper clearing
             if current_offset != editor.viewport_offset {
-                // Hide cursor during the second draw to reduce flicker
-                terminal.hide_cursor().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                
-                // Skip terminal.clear() to reduce flicker - the draw_ui clearing should be sufficient
-                terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                
-                // Show cursor again after drawing is complete
-                terminal.show_cursor().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                // Draw without cursor positioning to reduce flicker
+                terminal.draw(|f| draw_ui_with_cursor(f, &mut editor, false)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
         }
         
@@ -2887,6 +2881,10 @@ fn handle_editor_key(editor: &mut Editor, key: event::KeyEvent, viewport_width: 
 }
 
 fn draw_ui(f: &mut Frame, editor: &mut Editor) {
+    draw_ui_with_cursor(f, editor, true);
+}
+
+fn draw_ui_with_cursor(f: &mut Frame, editor: &mut Editor, show_cursor: bool) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3170,7 +3168,9 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                 }
                 let screen_pos = visual_cursor_pos.saturating_sub(prompt.save_as_scroll_offset);
                 let cursor_x = input_area[1].x + screen_pos.min(input_area[1].width as usize - 1) as u16;
-                f.set_cursor_position((cursor_x, input_area[1].y));
+                if show_cursor {
+                    f.set_cursor_position((cursor_x, input_area[1].y));
+                }
             }
             PromptType::ConfirmSave => {
                 let area = centered_rect(60, 20, f.area());
@@ -3346,7 +3346,9 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                         }
                         _ => unreachable!(),
                     };
-                    f.set_cursor_position((cursor_field.0, cursor_field.1));
+                    if show_cursor {
+                        f.set_cursor_position((cursor_field.0, cursor_field.1));
+                    }
                 } else {
                     // When buffer has focus, set cursor in the editor area
                     let (caret_row, caret_col) = editor.get_visual_position(editor.caret, viewport_width);
@@ -3359,10 +3361,12 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
                         };
                         
                         if screen_col < viewport_width {
-                            f.set_cursor_position((
-                                find_replace_chunks[0].x + screen_col as u16,
-                                find_replace_chunks[0].y + screen_row as u16,
-                            ));
+                            if show_cursor {
+                                f.set_cursor_position((
+                                    find_replace_chunks[0].x + screen_col as u16,
+                                    find_replace_chunks[0].y + screen_row as u16,
+                                ));
+                            }
                         }
                     }
                 }
@@ -3424,10 +3428,12 @@ fn draw_ui(f: &mut Frame, editor: &mut Editor) {
             };
             
             if screen_col < viewport_width {
-                f.set_cursor_position((
-                    chunks[0].x + screen_col as u16,
-                    chunks[0].y + screen_row as u16,
-                ));
+                if show_cursor {
+                    f.set_cursor_position((
+                        chunks[0].x + screen_col as u16,
+                        chunks[0].y + screen_row as u16,
+                    ));
+                }
             }
         }
     }
