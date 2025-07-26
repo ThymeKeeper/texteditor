@@ -2265,8 +2265,14 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
             
             // If viewport changed, force another draw to ensure proper clearing
             if current_offset != editor.viewport_offset {
+                // Hide cursor during the second draw to reduce flicker
+                terminal.hide_cursor().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                
                 // Skip terminal.clear() to reduce flicker - the draw_ui clearing should be sufficient
                 terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                
+                // Show cursor again after drawing is complete
+                terminal.show_cursor().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
         }
         
