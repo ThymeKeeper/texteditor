@@ -2270,40 +2270,36 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                 terminal.clear().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
             
-            // If viewport is changing, hide cursor completely during redraws
+            // Always hide cursor before drawing on Windows
+            terminal.hide_cursor().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            
+            // Draw without cursor
+            terminal.draw(|f| draw_ui_with_cursor(f, &mut editor, false)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            
+            // If viewport changed, do another draw for clearing
             if viewport_changed {
-                terminal.hide_cursor().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                
-                // First draw for clearing
                 terminal.draw(|f| draw_ui_with_cursor(f, &mut editor, false)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                
-                // Second draw with content but no cursor
-                terminal.draw(|f| draw_ui_with_cursor(f, &mut editor, false)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                
-                // Show cursor and set position manually
-                terminal.show_cursor().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                
-                // Final draw just to position cursor
-                terminal.draw(|f| {
-                    // Only set cursor position, don't redraw everything
-                    let (caret_row, caret_col) = editor.get_visual_position(editor.caret, viewport_width);
-                    if caret_row >= editor.viewport_offset.0 && caret_row < editor.viewport_offset.0 + viewport_height {
-                        let screen_row = caret_row - editor.viewport_offset.0;
-                        let screen_col = if editor.word_wrap {
-                            caret_col
-                        } else {
-                            caret_col.saturating_sub(editor.viewport_offset.1)
-                        };
-                        
-                        if screen_col < viewport_width {
-                            f.set_cursor_position((screen_col as u16, screen_row as u16));
-                        }
-                    }
-                }).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            } else {
-                // Normal draw with cursor
-                terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
+            
+            // Now position and show cursor
+            let (caret_row, caret_col) = editor.get_visual_position(editor.caret, viewport_width);
+            if caret_row >= editor.viewport_offset.0 && caret_row < editor.viewport_offset.0 + viewport_height {
+                let screen_row = caret_row - editor.viewport_offset.0;
+                let screen_col = if editor.word_wrap {
+                    caret_col
+                } else {
+                    caret_col.saturating_sub(editor.viewport_offset.1)
+                };
+                
+                if screen_col < viewport_width {
+                    execute!(
+                        io::stdout(),
+                        MoveTo(screen_col as u16, screen_row as u16)
+                    ).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                }
+            }
+            
+            terminal.show_cursor().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         }
         
         #[cfg(not(target_os = "windows"))]
