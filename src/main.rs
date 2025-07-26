@@ -2253,7 +2253,16 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
         // Windows-specific: Force full redraw on viewport changes or modal dismissal
         #[cfg(target_os = "windows")]
         {
-            let current_offset = editor.viewport_offset;
+            let size = terminal.size().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let viewport_height = size.height as usize - 1;
+            let viewport_width = size.width as usize;
+            
+            // Update viewport BEFORE drawing to get correct positions
+            editor.ensure_visual_lines(viewport_width);
+            let old_offset = editor.viewport_offset;
+            editor.update_viewport(viewport_height, viewport_width);
+            let viewport_changed = old_offset != editor.viewport_offset;
+            
             let was_modal_dismissed = editor.modal_just_dismissed;
             
             // If modal was just dismissed, clear terminal before drawing
@@ -2261,13 +2270,13 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                 terminal.clear().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
             
-            terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            
-            // If viewport changed, force another draw to ensure proper clearing
-            if current_offset != editor.viewport_offset {
-                // Draw without cursor positioning to reduce flicker
+            // If viewport will change, draw without cursor first
+            if viewport_changed {
                 terminal.draw(|f| draw_ui_with_cursor(f, &mut editor, false)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
+            
+            // Final draw with cursor
+            terminal.draw(|f| draw_ui(f, &mut editor)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         }
         
         #[cfg(not(target_os = "windows"))]
@@ -2881,6 +2890,13 @@ fn handle_editor_key(editor: &mut Editor, key: event::KeyEvent, viewport_width: 
 }
 
 fn draw_ui(f: &mut Frame, editor: &mut Editor) {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let viewport_height = f.area().height as usize - 1;
+        let viewport_width = f.area().width as usize;
+        editor.ensure_visual_lines(viewport_width);
+        editor.update_viewport(viewport_height, viewport_width);
+    }
     draw_ui_with_cursor(f, editor, true);
 }
 
@@ -2903,8 +2919,8 @@ fn draw_ui_with_cursor(f: &mut Frame, editor: &mut Editor, show_cursor: bool) {
     #[cfg(target_os = "windows")]
     let modal_dismissed = editor.modal_just_dismissed;
     
+    // Viewport updating is now done before draw_ui is called
     editor.ensure_visual_lines(viewport_width);
-    editor.update_viewport(viewport_height, viewport_width);
     
     #[cfg(target_os = "windows")]
     {
